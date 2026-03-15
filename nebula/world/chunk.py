@@ -1,6 +1,6 @@
 """
 区块数据结构
-基于 MCP940 源代码实现正确的 1.12.2 区块格式
+基于 Minecraft 1.12.2 源代码实现正确的 1.12.2 区块格式
 """
 
 import struct
@@ -15,7 +15,7 @@ SECTION_HEIGHT = 16
 SECTION_COUNT = 64  # 1024 / 16
 
 # 方块ID (1.12.2 全局方块状态 ID)
-# 从 MCP940 的 Block.registerBlocks() 获取
+# 从 Minecraft 1.12.2 的 Block.registerBlocks() 获取
 # 方块状态 ID = (方块注册 ID << 4) | 元数据
 BLOCK_STATE_AIR = 0      # air: (0 << 4) | 0 = 0
 BLOCK_STATE_STONE = 16   # stone: (1 << 4) | 0 = 16
@@ -121,7 +121,7 @@ class BitArray:
 class PaletteLinear:
     """
     线性调色板 (bits <= 4)
-    参考 MCP940 的 BlockStatePaletteLinear
+    参考 Minecraft 1.12.2 的 BlockStatePaletteLinear
     """
     
     def __init__(self, bits: int):
@@ -182,7 +182,7 @@ class PaletteLinear:
 class ChunkSection:
     """
     区块段（16x16x16的方块区域）
-    基于 MCP940 的 ExtendedBlockStorage 实现
+    基于 Minecraft 1.12.2 的 ExtendedBlockStorage 实现
     """
     
     def __init__(self, y_index: int):
@@ -231,7 +231,7 @@ class ChunkSection:
         """
         获取区块段的方块数据，用于发送给客户端
         1.12.2 格式: BitsPerEntry(1) + Palette(VarInt[]) + DataArrayLength(VarInt) + DataArray(long[])
-        参考 MCP940 的 BlockStateContainer.write()
+        参考 Minecraft 1.12.2 的 BlockStateContainer.write()
         """
         # 始终使用全局调色板（13 bits）以确保兼容性
         return self._get_global_palette_data()
@@ -337,7 +337,7 @@ class Chunk:
     def get_chunk_data(self, has_sky_light: bool = True) -> bytes:
         """
         获取完整的区块数据，用于发送给客户端
-        参考 MCP940 的 SPacketChunkData
+        参考 Minecraft 1.12.2 的 SPacketChunkData
         """
         result = bytearray()
         

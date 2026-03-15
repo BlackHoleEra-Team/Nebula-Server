@@ -420,7 +420,7 @@ def send_empty_chunk(conn: socket.socket, chunk_x: int, chunk_z: int):
 def send_chunk_data(conn: socket.socket, chunk: Chunk):
     """
     发送真实区块数据
-    参考 MCP940 的 SPacketChunkData 实现
+    参考 Minecraft 1.12.2 的 SPacketChunkData 实现
     """
     try:
         packet = bytearray()

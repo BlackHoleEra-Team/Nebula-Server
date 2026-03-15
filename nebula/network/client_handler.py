@@ -386,7 +386,7 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
 
 def decode_block_pos(pos: int) -> tuple:
     """
-    解码 BlockPos (参考 MCP940 的 BlockPos.fromLong)
+    解码 BlockPos (参考 Minecraft 1.12.2 的 BlockPos.fromLong)
     NUM_X_BITS = 26, NUM_Y_BITS = 12, NUM_Z_BITS = 26
     """
     NUM_X_BITS = 26
