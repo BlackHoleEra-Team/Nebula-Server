@@ -158,9 +158,9 @@ def enter_play_phase(conn: socket.socket, username: str, player_uuid: str):
     # 8. 发送时间
     send_time_update(conn, world_age=0, time_of_day=6000)
     
-    # 9. 发送周围的区块（视距 12 = 25x25 区域）
-    VIEW_DISTANCE = 12
-    log_info(f"Loading chunks for {username} (view distance: {VIEW_DISTANCE})...")
+    # 9. 发送周围的区块（视距 16 = 33x33 区域，共 1089 个区块）
+    VIEW_DISTANCE = 16
+    log_info(f"Loading chunks for {username} (view distance: {VIEW_DISTANCE}, total chunks: {(VIEW_DISTANCE*2+1)**2})...")
     
     # 按距离排序，先发送近的区块
     chunks_to_load = []
@@ -227,7 +227,7 @@ def wait_for_teleport_confirm(conn: socket.socket, timeout: float = 5.0) -> bool
     return False
 
 
-def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, world_manager=None, view_distance=12):
+def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, world_manager=None, view_distance=16):
     """保持连接循环，包含动态区块加载"""
     last_keep_alive = time.time()
     keep_alive_id = 0
