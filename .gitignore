@@ -42,6 +42,15 @@ server.properties
 cuberite/
 mcp940/
 
+# Heightmap generator
+heightmap.png
+heightmap_large.png
+generate_heightmap.py
+
 # OS
 .DS_Store
 Thumbs.db
+
+
+
+/mc1.18.2/

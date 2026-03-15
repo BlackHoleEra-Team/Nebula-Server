@@ -476,6 +476,9 @@ def send_chunk_data(conn: socket.socket, chunk: Chunk):
         section_count = bin(section_mask).count('1')
         log_info(f"Sent Chunk Data: ({chunk.chunk_x}, {chunk.chunk_z}), mask={section_mask:04x}, sections={section_count}, chunk_data_size={len(chunk_data)}, total_size={len(packet)}")
         
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+        # 客户端已断开连接，这是正常的，不需要记录为错误
+        pass
     except Exception as e:
         log_error(f"Error sending chunk data: {e}")
 

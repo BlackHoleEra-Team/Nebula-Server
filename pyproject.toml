@@ -31,8 +31,8 @@ nebula = "nebula.main:start_server"
 
 [project.urls]
 Homepage = "https://github.com/BlackHoleEra-Team"
-Repository = "https://github.com/BlackHoleEra-Team/NebulaServer"
-Issues = "https://github.com/BlackHoleEra-Team/NebulaServer/issues"
+Repository = "https://github.com/BlackHoleEra-Team/Nebula-Server"
+Issues = "https://github.com/BlackHoleEra-Team/Nebula-Server/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nebula"]
