@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nebula"
+version = "0.0.1-Alpha"
+description = "Nebula Minecraft Server 1.12.2"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "GPL-3.0"}
+authors = [
+    {name = "BlackHoleEra-Team"}
+]
+keywords = ["minecraft", "server", "1.12.2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+]
+
+[project.scripts]
+nebula = "nebula.main:start_server"
+
+[project.urls]
+Homepage = "https://github.com/BlackHoleEra-Team"
+Repository = "https://github.com/BlackHoleEra-Team/NebulaServer"
+Issues = "https://github.com/BlackHoleEra-Team/NebulaServer/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nebula"]
