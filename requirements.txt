@@ -1,6 +1,9 @@
 # Nebula Minecraft Server 1.12.2
-# 此项目仅使用 Python 标准库，无需额外依赖
-# Python 版本要求: >=3.8(未经测试)
+# Python 版本要求: >=3.8
 # 项目开发版本：Python 3.12.9
+
+# 核心依赖
+numba>=0.60.0  # JIT 编译加速地形生成
+
 # 开发依赖（可选）
 # hatchling>=1.0.0  # 用于构建包

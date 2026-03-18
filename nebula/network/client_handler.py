@@ -160,33 +160,47 @@ def enter_play_phase(conn: socket.socket, username: str, player_uuid: str):
     
     # 9. 发送周围的区块（视距 16 = 33x33 区域，共 1089 个区块）
     VIEW_DISTANCE = 16
-    log_info(f"Loading chunks for {username} (view distance: {VIEW_DISTANCE}, total chunks: {(VIEW_DISTANCE*2+1)**2})...")
+    
+    # 计算玩家当前所在的区块坐标
+    player_chunk_x = int(player.x) // 16
+    player_chunk_z = int(player.z) // 16
+    
+    log_info(f"Loading chunks for {username} at chunk ({player_chunk_x}, {player_chunk_z}) "
+             f"(view distance: {VIEW_DISTANCE}, total chunks: {(VIEW_DISTANCE*2+1)**2})...")
+    
+    # 记录已发送的区块
+    sent_chunks = set()
     
     # 按距离排序，先发送近的区块
     chunks_to_load = []
-    for cx in range(-VIEW_DISTANCE, VIEW_DISTANCE + 1):
-        for cz in range(-VIEW_DISTANCE, VIEW_DISTANCE + 1):
-            distance = math.sqrt(cx * cx + cz * cz)
-            chunks_to_load.append((distance, cx, cz))
+    for dx in range(-VIEW_DISTANCE, VIEW_DISTANCE + 1):
+        for dz in range(-VIEW_DISTANCE, VIEW_DISTANCE + 1):
+            distance = math.sqrt(dx * dx + dz * dz)
+            chunk_x = player_chunk_x + dx
+            chunk_z = player_chunk_z + dz
+            chunks_to_load.append((distance, chunk_x, chunk_z))
     
     # 按距离排序
     chunks_to_load.sort(key=lambda x: x[0])
     
     # 发送区块数据
-    for distance, cx, cz in chunks_to_load:
+    for distance, chunk_x, chunk_z in chunks_to_load:
         try:
             # 从世界管理器获取或生成区块
-            chunk = world_manager.get_chunk(cx, cz)
+            chunk = world_manager.get_chunk(chunk_x, chunk_z)
             if chunk:
                 # 发送区块数据
                 send_chunk_data(conn, chunk)
+                sent_chunks.add((chunk_x, chunk_z))
         except Exception as e:
-            log_error(f"Error loading chunk ({cx}, {cz}): {e}")
+            log_error(f"Error loading chunk ({chunk_x}, {chunk_z}): {e}")
     
-    log_info(f"Player {username} entered the world! Loaded {len(chunks_to_load)} chunks")
+    log_info(f"Player {username} entered the world! Loaded {len(sent_chunks)} chunks")
     
-    # 10. 保持连接，处理Keep Alive和玩家输入
-    keep_alive_loop(conn, username, player_manager, world_manager, VIEW_DISTANCE)
+    # 10. 保持连接，处理Keep Alive和玩家输入（传入玩家初始区块坐标和已发送区块）
+    keep_alive_loop(conn, username, player_manager, world_manager, VIEW_DISTANCE, 
+                    initial_chunk_x=player_chunk_x, initial_chunk_z=player_chunk_z,
+                    initial_sent_chunks=sent_chunks)
     
     return player
 
@@ -227,19 +241,19 @@ def wait_for_teleport_confirm(conn: socket.socket, timeout: float = 5.0) -> bool
     return False
 
 
-def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, world_manager=None, view_distance=16):
+def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, world_manager=None, view_distance=16, initial_chunk_x=0, initial_chunk_z=0, initial_sent_chunks=None):
     """保持连接循环，包含动态区块加载"""
     last_keep_alive = time.time()
     keep_alive_id = 0
     last_physics_update = time.time()
     last_chunk_update = time.time()
     
-    # 记录玩家当前所在的区块坐标
-    last_chunk_x = 0
-    last_chunk_z = 0
+    # 记录玩家当前所在的区块坐标（使用初始位置）
+    last_chunk_x = initial_chunk_x
+    last_chunk_z = initial_chunk_z
     
-    # 已发送的区块集合
-    sent_chunks = set()
+    # 已发送的区块集合（使用初始加载的区块）
+    sent_chunks = initial_sent_chunks if initial_sent_chunks is not None else set()
     
     conn.settimeout(1.0)  # 1秒超时用于轮询
     
@@ -278,6 +292,16 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
                         last_chunk_x = current_chunk_x
                         last_chunk_z = current_chunk_z
                         
+                        # 获取玩家朝向（yaw角度）
+                        player_yaw = getattr(player, 'yaw', 0.0)
+                        # 将yaw转换为面向的区块方向（0-360度）
+                        # yaw: -180(北) 0(南) 180(北), 需要转换
+                        facing_angle = (-player_yaw + 180) % 360  # 0-360, 0=北, 90=东, 180=南, 270=西
+                        facing_rad = math.radians(facing_angle)
+                        # 面向的向量
+                        facing_dx = math.sin(facing_rad)  # 东为正
+                        facing_dz = -math.cos(facing_rad)  # 南为正
+                        
                         # 加载视距范围内的区块
                         chunks_to_send = []
                         for dx in range(-view_distance, view_distance + 1):
@@ -290,13 +314,27 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
                                 if chunk_key not in sent_chunks:
                                     distance = math.sqrt(dx * dx + dz * dz)
                                     if distance <= view_distance:
-                                        chunks_to_send.append((distance, chunk_x, chunk_z))
+                                        # 计算区块在玩家面向方向的权重
+                                        # 归一化方向向量
+                                        if distance > 0:
+                                            norm_dx = dx / distance
+                                            norm_dz = dz / distance
+                                        else:
+                                            norm_dx = 0
+                                            norm_dz = 0
+                                        
+                                        # 点积：1表示正前方，-1表示正后方
+                                        facing_dot = norm_dx * facing_dx + norm_dz * facing_dz
+                                        # 转换为优先级：前方优先，距离次之
+                                        priority = distance - facing_dot * 5  # 前方区块优先级提高
+                                        
+                                        chunks_to_send.append((priority, chunk_x, chunk_z))
                         
-                        # 按距离排序，先发送近的
+                        # 按优先级排序（优先级低的先发送）
                         chunks_to_send.sort(key=lambda x: x[0])
                         
                         # 每次最多发送 5 个新区块，避免卡顿
-                        for i, (distance, chunk_x, chunk_z) in enumerate(chunks_to_send[:5]):
+                        for i, (priority, chunk_x, chunk_z) in enumerate(chunks_to_send[:5]):
                             try:
                                 chunk = world_manager.get_chunk(chunk_x, chunk_z)
                                 if chunk:

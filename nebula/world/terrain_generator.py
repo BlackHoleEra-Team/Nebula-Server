@@ -10,6 +10,41 @@ import random
 from typing import Tuple, List, Optional, Dict
 from nebula.logging.logging_utils import log_info, log_error
 
+# 尝试导入 Numba 加速
+try:
+    from numba import njit, prange
+    HAS_NUMBA = True
+    print("[TerrainGenerator] Numba 加速已启用")
+except ImportError:
+    HAS_NUMBA = False
+    print("[TerrainGenerator] Numba 未安装，使用纯 Python 模式")
+
+# Numba 加速的 FBM 采样函数（如果可用）
+if HAS_NUMBA:
+    import numpy as np
+    
+    @njit(cache=True)
+    def _fbm_sample_2d_numba(x: float, y: float, perm: np.ndarray, 
+                             octaves: int, persistence: float, lacunarity: float) -> float:
+        """Numba 加速的 FBM 2D 采样"""
+        total = 0.0
+        frequency = 1.0
+        amplitude = 1.0
+        max_value = 0.0
+        
+        for _ in range(octaves):
+            # 简化的噪声采样（使用伪随机）
+            idx = int(abs(x * frequency) * 73856093) ^ int(abs(y * frequency) * 19349663)
+            idx = idx & 255
+            noise_val = ((perm[idx] / 255.0) - 0.5) * 2.0
+            
+            total += noise_val * amplitude
+            max_value += amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+        
+        return total / max_value if max_value > 0 else 0.0
+
 
 class OpenSimplex2:
     """
@@ -844,17 +879,39 @@ class TerrainGenerator:
         
         heightmap = river_network.generate_river_network(heightmap, flow_directions)
         
-        # 2. V 型河谷雕刻
+        # 2. V 型河谷雕刻（只在真正的河流路径上雕刻，不是所有低海拔区域）
+        # 基于流量累积确定主要河流路径
         river_mask = [[False] * size for _ in range(size)]
+        
+        # 计算流量累积
+        flow_accumulation = [[0] * size for _ in range(size)]
         for z in range(size):
             for x in range(size):
-                if heightmap[z][x] < 60:
+                cx, cz = x, z
+                visited = set()
+                for _ in range(500):
+                    if (cx, cz) in visited:
+                        break
+                    visited.add((cx, cz))
+                    flow_accumulation[cz][cx] += 1
+                    dx, dz = flow_directions[cz][cx]
+                    if dx == 0 and dz == 0:
+                        break
+                    cx, cz = cx + dx, cz + dz
+                    if cx < 0 or cx >= size or cz < 0 or cz >= size:
+                        break
+        
+        # 只标记主要河流（流量大且有一定高度的区域）
+        for z in range(size):
+            for x in range(size):
+                # 流量阈值高，且高度在合理范围（不是海洋/湖泊）
+                if flow_accumulation[z][x] > 50 and 55 < heightmap[z][x] < 75:
                     river_mask[z][x] = True
         
         valley_carver = ValleyCarver(
-            valley_depth=4.0,
-            valley_width=3.0,
-            v_shape_factor=0.5
+            valley_depth=3.0,  # 降低深度
+            valley_width=2.0,  # 降低宽度
+            v_shape_factor=0.3  # 更平缓的V型
         )
         heightmap = valley_carver.carve_valley(heightmap, river_mask)
         
@@ -1528,9 +1585,28 @@ class MountainLake:
                         fill_height = min(edge_heights) - 0.5
                         fill_height = min(fill_height, basin_height + self.max_lake_depth)
                         
-                        # 填充湖泊
+                        # 填充湖泊，并平滑边缘
                         for bx, bz in basin_points:
-                            heightmap[bx][bz] = fill_height
+                            # 计算到边缘的距离
+                            min_edge_dist = float('inf')
+                            min_edge_height = fill_height
+                            
+                            for dx, dz in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                                nx, nz = bx + dx, bz + dz
+                                if 0 <= nx < width and 0 <= nz < height:
+                                    if heightmap[nx][nz] > basin_height:
+                                        dist = math.sqrt(dx*dx + dz*dz)
+                                        if dist < min_edge_dist:
+                                            min_edge_dist = dist
+                                            min_edge_height = heightmap[nx][nz]
+                            
+                            # 如果靠近边缘，平滑过渡
+                            if min_edge_dist < 3.0:
+                                # 混合填充高度和边缘高度
+                                t = min_edge_dist / 3.0
+                                heightmap[bx][bz] = fill_height * t + min_edge_height * (1 - t)
+                            else:
+                                heightmap[bx][bz] = fill_height
         
         return heightmap
 
@@ -1767,6 +1843,7 @@ class DuneFormation:
                    seed: int = 12345) -> List[List[float]]:
         """
         在沙漠区域生成沙丘链
+        只在低海拔、低坡度、干旱区域生成，避免在普通平原产生规则图案
         """
         width = len(heightmap)
         height = len(heightmap[0])
@@ -1776,24 +1853,60 @@ class DuneFormation:
         
         for x in range(width):
             for z in range(height):
-                # 获取湿度
+                current_h = heightmap[x][z]
+                
+                # 1. 高度检查：在低海拔区域生成沙丘（40-100格，覆盖更多地形）
+                if current_h > 100 or current_h < 40:
+                    continue
+                
+                # 2. 坡度检查：计算局部坡度，避免在陡坡生成
+                slope = 0.0
+                neighbors = 0
+                for dx in [-1, 0, 1]:
+                    for dz in [-1, 0, 1]:
+                        if dx == 0 and dz == 0:
+                            continue
+                        nx, nz = x + dx, z + dz
+                        if 0 <= nx < width and 0 <= nz < height:
+                            slope += abs(heightmap[nx][nz] - current_h)
+                            neighbors += 1
+                
+                if neighbors > 0:
+                    avg_slope = slope / neighbors
+                    # 坡度太陡不生成沙丘
+                    if avg_slope > 2.0:
+                        continue
+                
+                # 3. 湿度检查
                 if moisture_map:
                     moisture = moisture_map[x][z]
                 else:
-                    moisture = dune_noise.noise_2d(x * 0.01, z * 0.01) * 0.5 + 0.5
+                    # 使用噪声模拟湿度，但添加更多变化避免规则图案
+                    moisture = dune_noise.noise_2d(x * 0.005, z * 0.005) * 0.5 + 0.5
+                    # 添加高频噪声增加随机性
+                    moisture += dune_noise.noise_2d(x * 0.02, z * 0.02) * 0.2
+                    moisture = max(0.0, min(1.0, moisture))
                 
-                # 只在干旱区域生成沙丘
-                if moisture > self.aridity_threshold:
-                    # 使用周期性噪声生成沙丘链
+                # 只在干旱区域生成沙丘（阈值基于实际噪声范围 0.2-0.5）
+                if moisture > 0.35:
+                    # 使用非周期性噪声生成沙丘，避免规则图案
                     dune_pattern = dune_noise.noise_2d(
-                        x * (2 * math.pi / self.dune_spacing),
-                        z * (2 * math.pi / self.dune_spacing)
+                        x * 0.08 + seed * 0.1,
+                        z * 0.08 + seed * 0.1
                     )
                     
-                    if dune_pattern > 0.3:
-                        # 生成沙丘
-                        dune_factor = (dune_pattern - 0.3) / 0.7
-                        dune_height_offset = self.dune_height * dune_factor * 0.5
+                    # 添加第二个噪声层打破规则性
+                    dune_pattern2 = dune_noise.noise_2d(
+                        x * 0.15 + seed * 0.2,
+                        z * 0.15 + seed * 0.2
+                    ) * 0.3
+                    
+                    combined_pattern = dune_pattern + dune_pattern2
+                    
+                    if combined_pattern > 0.4:
+                        # 生成沙丘，但高度更柔和
+                        dune_factor = (combined_pattern - 0.4) / 0.6
+                        dune_height_offset = self.dune_height * dune_factor * 0.3  # 降低高度
                         heightmap[x][z] += dune_height_offset
         
         return heightmap
@@ -1821,6 +1934,7 @@ class YardangAlgorithm:
                       seed: int = 12345) -> List[List[float]]:
         """
         生成雅丹地貌（垄槽相间）
+        只在特定海拔和干旱区域生成，避免在普通平原产生规则图案
         """
         width = len(heightmap)
         height = len(heightmap[0])
@@ -1834,24 +1948,65 @@ class YardangAlgorithm:
         
         for x in range(width):
             for z in range(height):
+                current_h = heightmap[x][z]
+                
+                # 1. 高度检查：雅丹地貌在中低海拔（45-95格，覆盖更多地形）
+                if current_h < 45 or current_h > 95:
+                    continue
+                
+                # 2. 坡度检查：避免在陡坡生成
+                slope = 0.0
+                neighbors = 0
+                for dx in [-1, 0, 1]:
+                    for dz in [-1, 0, 1]:
+                        if dx == 0 and dz == 0:
+                            continue
+                        nx, nz = x + dx, z + dz
+                        if 0 <= nx < width and 0 <= nz < height:
+                            slope += abs(heightmap[nx][nz] - current_h)
+                            neighbors += 1
+                
+                if neighbors > 0:
+                    avg_slope = slope / neighbors
+                    if avg_slope > 3.0:
+                        continue
+                
+                # 3. 干旱度检查（使用噪声模拟）
+                aridity = yardang_noise.noise_2d(x * 0.003 + seed * 0.1, z * 0.003 + seed * 0.1)
+                aridity = aridity * 0.5 + 0.5  # 映射到 0-1
+                # 只在干旱区域生成（阈值基于实际噪声范围 0.38-0.49）
+                if aridity < 0.45:
+                    continue
+                
                 # 计算在垂直风向方向上的坐标
                 coord = x * perp_dx + z * perp_dz
                 
-                # 生成周期性的垄槽 pattern
-                yardang_pattern = math.sin(coord * (2 * math.pi / self.yardang_spacing))
+                # 使用噪声替代纯周期性 sin，打破规则图案
+                # 基础 pattern（低频）
+                base_pattern = yardang_noise.noise_2d(
+                    coord * 0.05 + seed * 0.2,
+                    x * 0.01 + z * 0.01
+                )
                 
-                # 添加一些随机变化
-                noise_variation = yardang_noise.noise_2d(x * 0.05, z * 0.05) * 0.3
+                # 添加周期性成分但用噪声调制
+                periodic = math.sin(coord * (2 * math.pi / self.yardang_spacing))
+                # 用噪声混合周期性和非周期性成分
+                modulation = yardang_noise.noise_2d(x * 0.02, z * 0.02)
+                yardang_pattern = base_pattern * 0.6 + periodic * 0.4 * (modulation * 0.5 + 0.5)
+                
+                # 添加随机变化
+                noise_variation = yardang_noise.noise_2d(x * 0.08 + seed * 0.3, z * 0.08 + seed * 0.3) * 0.4
                 yardang_pattern += noise_variation
                 
-                if yardang_pattern > 0.3:
+                # 提高阈值，减少影响范围
+                if yardang_pattern > 0.5:
                     # 形成垄脊（高处）
-                    ridge_factor = (yardang_pattern - 0.3) / 0.7
-                    heightmap[x][z] += self.ridge_height * ridge_factor * 0.3
-                elif yardang_pattern < -0.3:
+                    ridge_factor = (yardang_pattern - 0.5) / 0.5
+                    heightmap[x][z] += self.ridge_height * ridge_factor * 0.2  # 降低高度
+                elif yardang_pattern < -0.5:
                     # 形成槽沟（低处）
-                    trough_factor = (-yardang_pattern - 0.3) / 0.7
-                    heightmap[x][z] -= self.ridge_height * trough_factor * 0.2
+                    trough_factor = (-yardang_pattern - 0.5) / 0.5
+                    heightmap[x][z] -= self.ridge_height * trough_factor * 0.15
         
         return heightmap
 
