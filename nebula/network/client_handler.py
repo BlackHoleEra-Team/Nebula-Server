@@ -3,6 +3,7 @@
 处理每个客户端的完整生命周期
 """
 
+import select
 import socket
 import struct
 import time
@@ -160,16 +161,18 @@ def enter_play_phase(conn: socket.socket, username: str, player_uuid: str):
     
     # 9. 发送周围的区块（视距 16 = 33x33 区域，共 1089 个区块）
     VIEW_DISTANCE = 16
+    SYNC_LOAD_DISTANCE = 1  # 只同步加载最近的 3x3 = 9 个区块（减少阻塞）
     
     # 计算玩家当前所在的区块坐标
     player_chunk_x = int(player.x) // 16
     player_chunk_z = int(player.z) // 16
     
     log_info(f"Loading chunks for {username} at chunk ({player_chunk_x}, {player_chunk_z}) "
-             f"(view distance: {VIEW_DISTANCE}, total chunks: {(VIEW_DISTANCE*2+1)**2})...")
+             f"(view distance: {VIEW_DISTANCE}, sync load first {SYNC_LOAD_DISTANCE*2+1}x{SYNC_LOAD_DISTANCE*2+1})...")
     
     # 记录已发送的区块
     sent_chunks = set()
+    pending_chunks = []  # 待后续加载的区块
     
     # 按距离排序，先发送近的区块
     chunks_to_load = []
@@ -183,24 +186,46 @@ def enter_play_phase(conn: socket.socket, username: str, player_uuid: str):
     # 按距离排序
     chunks_to_load.sort(key=lambda x: x[0])
     
-    # 发送区块数据
-    for distance, chunk_x, chunk_z in chunks_to_load:
-        try:
-            # 从世界管理器获取或生成区块
-            chunk = world_manager.get_chunk(chunk_x, chunk_z)
-            if chunk:
-                # 发送区块数据
-                send_chunk_data(conn, chunk)
-                sent_chunks.add((chunk_x, chunk_z))
-        except Exception as e:
-            log_error(f"Error loading chunk ({chunk_x}, {chunk_z}): {e}")
+    # 先同步加载最近的区块（确保玩家周围立即显示）
+    # 使用非阻塞方式，每加载一个区块后检查是否有客户端数据
+    sync_loaded = 0
+    conn.setblocking(False)  # 设置为非阻塞模式
     
-    log_info(f"Player {username} entered the world! Loaded {len(sent_chunks)} chunks")
+    for distance, chunk_x, chunk_z in chunks_to_load:
+        if distance <= SYNC_LOAD_DISTANCE:
+            try:
+                chunk = world_manager.get_chunk(chunk_x, chunk_z)
+                if chunk:
+                    send_chunk_data(conn, chunk)
+                    sent_chunks.add((chunk_x, chunk_z))
+                    sync_loaded += 1
+                    
+                    # 每加载一个区块后，尝试读取客户端数据（非阻塞）
+                    try:
+                        packet_length = read_var_int(conn)
+                        if packet_length > 0:
+                            packet_data = read_exact_bytes(conn, packet_length, timeout=0.01)
+                            # 这里可以处理客户端数据，如命令
+                        elif packet_length == -1:
+                            pass  # 没有数据，继续加载
+                    except (BlockingIOError, socket.timeout):
+                        pass  # 没有数据，继续加载
+            except Exception as e:
+                log_error(f"Error loading chunk ({chunk_x}, {chunk_z}): {e}")
+        else:
+            # 远处的区块加入待加载队列
+            pending_chunks.append((distance, chunk_x, chunk_z))
+    
+    # 恢复阻塞模式
+    conn.setblocking(True)
+    
+    log_info(f"Player {username} entered the world! Sync loaded {sync_loaded} chunks, "
+             f"{len(pending_chunks)} chunks pending")
     
     # 10. 保持连接，处理Keep Alive和玩家输入（传入玩家初始区块坐标和已发送区块）
     keep_alive_loop(conn, username, player_manager, world_manager, VIEW_DISTANCE, 
                     initial_chunk_x=player_chunk_x, initial_chunk_z=player_chunk_z,
-                    initial_sent_chunks=sent_chunks)
+                    initial_sent_chunks=sent_chunks, pending_chunks=pending_chunks)
     
     return player
 
@@ -241,7 +266,7 @@ def wait_for_teleport_confirm(conn: socket.socket, timeout: float = 5.0) -> bool
     return False
 
 
-def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, world_manager=None, view_distance=16, initial_chunk_x=0, initial_chunk_z=0, initial_sent_chunks=None):
+def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, world_manager=None, view_distance=16, initial_chunk_x=0, initial_chunk_z=0, initial_sent_chunks=None, pending_chunks=None):
     """保持连接循环，包含动态区块加载"""
     last_keep_alive = time.time()
     keep_alive_id = 0
@@ -255,7 +280,14 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
     # 已发送的区块集合（使用初始加载的区块）
     sent_chunks = initial_sent_chunks if initial_sent_chunks is not None else set()
     
-    conn.settimeout(1.0)  # 1秒超时用于轮询
+    # 待加载的区块队列（从初始加载传递过来）
+    pending_chunks_list = pending_chunks if pending_chunks is not None else []
+    
+    # 每 tick 加载的区块数量（减少以避免阻塞命令）
+    CHUNKS_PER_TICK = 5
+    
+    # 使用 select 实现非阻塞 I/O
+    conn.setblocking(False)
     
     while True:
         try:
@@ -273,8 +305,8 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
                 player_manager.update_all_physics(delta_time)
                 last_physics_update = current_time
             
-            # 每0.5秒检查一次是否需要加载新区块
-            if world_manager and current_time - last_chunk_update >= 0.5:
+            # 区块加载（每0.05秒，更平滑的加载）
+            if world_manager and current_time - last_chunk_update >= 0.05:
                 last_chunk_update = current_time
                 
                 # 获取玩家当前位置
@@ -287,130 +319,157 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
                     current_chunk_x = int(player_x) // 16
                     current_chunk_z = int(player_z) // 16
                     
-                    # 如果玩家移动到了新的区块，加载周围的区块
+                    # 玩家移动了，重新计算待加载区块
                     if current_chunk_x != last_chunk_x or current_chunk_z != last_chunk_z:
                         last_chunk_x = current_chunk_x
                         last_chunk_z = current_chunk_z
                         
-                        # 获取玩家朝向（yaw角度）
-                        player_yaw = getattr(player, 'yaw', 0.0)
-                        # 将yaw转换为面向的区块方向（0-360度）
-                        # yaw: -180(北) 0(南) 180(北), 需要转换
-                        facing_angle = (-player_yaw + 180) % 360  # 0-360, 0=北, 90=东, 180=南, 270=西
-                        facing_rad = math.radians(facing_angle)
-                        # 面向的向量
-                        facing_dx = math.sin(facing_rad)  # 东为正
-                        facing_dz = -math.cos(facing_rad)  # 南为正
-                        
-                        # 加载视距范围内的区块
-                        chunks_to_send = []
+                        # 重新计算待加载区块列表（基于新位置）
+                        pending_chunks_list = []
                         for dx in range(-view_distance, view_distance + 1):
                             for dz in range(-view_distance, view_distance + 1):
                                 chunk_x = current_chunk_x + dx
                                 chunk_z = current_chunk_z + dz
                                 chunk_key = (chunk_x, chunk_z)
                                 
-                                # 只发送之前没发送过的区块
                                 if chunk_key not in sent_chunks:
-                                    distance = math.sqrt(dx * dx + dz * dz)
-                                    if distance <= view_distance:
-                                        # 计算区块在玩家面向方向的权重
-                                        # 归一化方向向量
-                                        if distance > 0:
-                                            norm_dx = dx / distance
-                                            norm_dz = dz / distance
-                                        else:
-                                            norm_dx = 0
-                                            norm_dz = 0
-                                        
-                                        # 点积：1表示正前方，-1表示正后方
-                                        facing_dot = norm_dx * facing_dx + norm_dz * facing_dz
-                                        # 转换为优先级：前方优先，距离次之
-                                        priority = distance - facing_dot * 5  # 前方区块优先级提高
-                                        
-                                        chunks_to_send.append((priority, chunk_x, chunk_z))
+                                    dist = math.sqrt(dx * dx + dz * dz)
+                                    if dist <= view_distance:
+                                        pending_chunks_list.append((dist, chunk_x, chunk_z))
                         
-                        # 按优先级排序（优先级低的先发送）
-                        chunks_to_send.sort(key=lambda x: x[0])
+                        # 按距离排序
+                        pending_chunks_list.sort(key=lambda x: x[0])
+                    
+                    # 每 tick 加载固定数量的区块
+                    chunks_loaded_this_tick = 0
+                    new_pending = []
+                    
+                    for dist, chunk_x, chunk_z in pending_chunks_list:
+                        if chunks_loaded_this_tick >= CHUNKS_PER_TICK:
+                            # 超过本 tick 限制，保留到下一 tick
+                            new_pending.append((dist, chunk_x, chunk_z))
+                            continue
                         
-                        # 每次最多发送 5 个新区块，避免卡顿
-                        for i, (priority, chunk_x, chunk_z) in enumerate(chunks_to_send[:5]):
-                            try:
-                                chunk = world_manager.get_chunk(chunk_x, chunk_z)
-                                if chunk:
-                                    send_chunk_data(conn, chunk)
-                                    sent_chunks.add((chunk_x, chunk_z))
-                            except Exception as e:
-                                log_error(f"Error sending chunk ({chunk_x}, {chunk_z}): {e}")
+                        chunk_key = (chunk_x, chunk_z)
+                        if chunk_key in sent_chunks:
+                            continue
+                        
+                        try:
+                            chunk = world_manager.get_chunk(chunk_x, chunk_z)
+                            if chunk:
+                                send_chunk_data(conn, chunk)
+                                sent_chunks.add(chunk_key)
+                                chunks_loaded_this_tick += 1
+                        except Exception as e:
+                            log_error(f"Error sending chunk ({chunk_x}, {chunk_z}): {e}")
+                            # 出错的区块保留到后面重试
+                            new_pending.append((dist, chunk_x, chunk_z))
+                    
+                    # 更新待加载列表
+                    pending_chunks_list = new_pending
+                    
+                    # 调试信息：显示加载进度
+                    if chunks_loaded_this_tick > 0:
+                        total_pending = len(pending_chunks_list)
+                        total_sent = len(sent_chunks)
+                        if total_pending > 0 and total_pending % 100 == 0:
+                            log_info(f"Chunk loading progress for {username}: {total_sent} sent, {total_pending} pending")
             
-            # 尝试读取客户端数据
-            try:
-                packet_length = read_var_int(conn)
-                if packet_length > 0:
-                    # 使用read_exact_bytes确保读取完整的数据包
-                    packet_data = read_exact_bytes(conn, packet_length, timeout=5.0)
-                    if len(packet_data) > 0:
-                        packet_id = packet_data[0]
-                        
-                        # 调试：记录所有收到的包
-                        if packet_id in [0x0B, 0x06, 0x1D]:
-                            log_info(f"Received packet 0x{packet_id:02x} from {username}, length={len(packet_data)}, data={packet_data.hex()}")
-                        
-                        # 处理客户端Keep Alive响应 (0x0C)
-                        if packet_id == 0x0C:
-                            # 1.12.2格式: keep_alive_id (long, 8 bytes)
-                            try:
-                                if len(packet_data) >= 9:
-                                    received_id = struct.unpack('>q', packet_data[1:9])[0]
-                                    log_info(f"Received Keep Alive response from {username}: {received_id}")
-                                else:
-                                    log_error(f"Keep Alive response too short: {len(packet_data)} bytes, data={packet_data.hex()}")
-                            except Exception as e:
-                                log_error(f"Error parsing Keep Alive response from {username}: {e}, data={packet_data.hex()}")
-                        
-                        # 处理玩家位置包 (0x0E)
-                        elif packet_id == 0x0E:
-                            if player_manager:
-                                player_manager.handle_player_move(username, packet_data, packet_id)
-                        
-                        # 处理玩家移动包 (0x0F)
-                        elif packet_id == 0x0F:
-                            if player_manager:
-                                player_manager.handle_player_move(username, packet_data, packet_id)
-                        
-                        # 处理玩家位置和视角包 (0x0D)
-                        elif packet_id == 0x0D:
-                            if player_manager:
-                                player_manager.handle_player_move(username, packet_data, packet_id)
-                        
-                        # 处理玩家能力包 (0x13) - 飞行状态
-                        elif packet_id == 0x13:
-                            if player_manager:
-                                player_manager.handle_player_abilities(username, packet_data)
-                        
-                        # 处理聊天消息 (0x02)
-                        elif packet_id == 0x02:
-                            log_info(f"Received chat from {username}")
-                        
-                        # 处理Teleport Confirm (0x00)
-                        elif packet_id == 0x00:
-                            # Teleport确认，暂时忽略
-                            pass
-                        
-                        # 处理玩家放置方块 (0x0B)
-                        elif packet_id == 0x0B:
-                            handle_player_block_placement(username, packet_data, conn)
-                        
-                        # 处理玩家破坏方块 (0x06)
-                        elif packet_id == 0x06:
-                            handle_player_block_break(username, packet_data, conn)
-                        
-                        else:
-                            log_info(f"Received packet from {username}: 0x{packet_id:02x}")
+            # 使用 select 检查是否有数据可读（非阻塞）
+            readable, _, _ = select.select([conn], [], [], 0)  # 0秒超时，立即返回
+            
+            if readable:
+                try:
+                    packet_length = read_var_int(conn)
+                    if packet_length > 0:
+                        packet_data = read_exact_bytes(conn, packet_length, timeout=0.01)
+                        if len(packet_data) > 0:
+                            packet_id = packet_data[0]
                             
-            except socket.timeout:
-                # 正常超时，继续循环
-                continue
+                            # 调试：记录所有收到的包
+                            if packet_id in [0x0B, 0x06, 0x1D]:
+                                log_info(f"Received packet 0x{packet_id:02x} from {username}, length={len(packet_data)}, data={packet_data.hex()}")
+                            
+                            # 处理客户端Keep Alive响应 (0x0C)
+                            if packet_id == 0x0C:
+                                # 1.12.2格式: keep_alive_id (long, 8 bytes)
+                                try:
+                                    if len(packet_data) >= 9:
+                                        received_id = struct.unpack('>q', packet_data[1:9])[0]
+                                        log_info(f"Received Keep Alive response from {username}: {received_id}")
+                                    else:
+                                        log_error(f"Keep Alive response too short: {len(packet_data)} bytes, data={packet_data.hex()}")
+                                except Exception as e:
+                                    log_error(f"Error parsing Keep Alive response from {username}: {e}, data={packet_data.hex()}")
+                            
+                            # 处理玩家位置包 (0x0E)
+                            elif packet_id == 0x0E:
+                                if player_manager:
+                                    player_manager.handle_player_move(username, packet_data, packet_id)
+                            
+                            # 处理玩家移动包 (0x0F)
+                            elif packet_id == 0x0F:
+                                if player_manager:
+                                    player_manager.handle_player_move(username, packet_data, packet_id)
+                            
+                            # 处理玩家位置和视角包 (0x0D)
+                            elif packet_id == 0x0D:
+                                if player_manager:
+                                    player_manager.handle_player_move(username, packet_data, packet_id)
+                            
+                            # 处理玩家能力包 (0x13) - 飞行状态
+                            elif packet_id == 0x13:
+                                if player_manager:
+                                    player_manager.handle_player_abilities(username, packet_data)
+                            
+                            # 处理聊天消息 (0x02)
+                            elif packet_id == 0x02:
+                                try:
+                                    # 解析聊天消息 (1.12.2格式: packet_id + varint长度 + UTF-8字符串)
+                                    from nebula.network.packet_utils import read_var_int_from_bytes
+                                    msg_length, offset = read_var_int_from_bytes(packet_data, 1)
+                                    log_info(f"DEBUG: Chat packet from {username}, msg_length={msg_length}, offset={offset}, packet_len={len(packet_data)}")
+                                    if msg_length > 0 and len(packet_data) >= offset + msg_length:
+                                        message = packet_data[offset:offset+msg_length].decode('utf-8')
+                                        log_info(f"Chat from {username}: '{message}'")
+                                        
+                                        # 处理命令
+                                        if message.startswith('/'):
+                                            log_info(f"DEBUG: Handling command '{message}' from {username}")
+                                            handle_command(conn, username, message, world_manager)
+                                        else:
+                                            # 普通聊天消息，广播给所有玩家
+                                            broadcast_chat_message(f"<{username}> {message}", username)
+                                    else:
+                                        log_info(f"DEBUG: Invalid chat packet, msg_length={msg_length}, available={len(packet_data)-offset}")
+                                except Exception as e:
+                                    log_error(f"Error parsing chat from {username}: {e}")
+                                    import traceback
+                                    log_error(traceback.format_exc())
+                            
+                            # 处理Teleport Confirm (0x00)
+                            elif packet_id == 0x00:
+                                # Teleport确认，暂时忽略
+                                pass
+                            
+                            # 处理 Tab 补全 (0x14)
+                            elif packet_id == 0x14:
+                                handle_tab_complete(conn, packet_data)
+                            
+                            # 处理玩家放置方块 (0x0B)
+                            elif packet_id == 0x0B:
+                                handle_player_block_placement(username, packet_data, conn)
+                            
+                            # 处理玩家破坏方块 (0x06)
+                            elif packet_id == 0x06:
+                                handle_player_block_break(username, packet_data, conn)
+                            
+                            else:
+                                log_info(f"Received packet from {username}: 0x{packet_id:02x}")
+                                
+                except BlockingIOError:
+                    # 没有数据，继续循环
+                    pass
                 
         except ConnectionError:
             log_info(f"Connection lost for {username}")
@@ -420,6 +479,177 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
             log_error(f"Error in keep alive loop for {username}: {e}")
             # 不要在这里移除玩家，让 finally 块处理保存和移除
             break
+
+
+def handle_command(conn: socket.socket, username: str, message: str, world_manager):
+    """
+    处理玩家输入的命令
+    """
+    from nebula.network.protocol import pack_var_int
+    
+    parts = message.split()
+    command = parts[0].lower()
+    args = parts[1:] if len(parts) > 1 else []
+    
+    try:
+        if command == '/time':
+            if len(args) == 0:
+                # 查询当前时间
+                current_time = int(world_manager.world_time) if world_manager else 6000
+                send_chat_message(conn, f"当前时间: {current_time} (0=日出, 6000=正午, 12000=日落, 18000=午夜)")
+            else:
+                # 设置时间
+                try:
+                    if args[0].lower() == 'day':
+                        new_time = 1000
+                    elif args[0].lower() == 'night':
+                        new_time = 13000
+                    elif args[0].lower() == 'noon':
+                        new_time = 6000
+                    elif args[0].lower() == 'midnight':
+                        new_time = 18000
+                    else:
+                        new_time = int(args[0])
+                    
+                    if world_manager:
+                        world_manager.world_time = new_time % 24000
+                        send_chat_message(conn, f"时间设置为: {new_time}")
+                        # 广播时间更新给所有玩家
+                        world_manager.broadcast_time_update()
+                except ValueError:
+                    send_chat_message(conn, "用法: /time [day|night|noon|midnight|<数值>]")
+        
+        elif command == '/help':
+            help_text = """可用命令:
+/time - 查看当前时间
+/time day - 设置为白天
+/time night - 设置为夜晚
+/time noon - 设置为正午
+/time midnight - 设置为午夜
+/time <数值> - 设置具体时间 (0-24000)
+/help - 显示此帮助"""
+            send_chat_message(conn, help_text)
+        
+        else:
+            send_chat_message(conn, f"未知命令: {command}. 输入 /help 查看可用命令")
+            
+    except Exception as e:
+        log_error(f"Error handling command '{command}' from {username}: {e}")
+        send_chat_message(conn, f"命令执行出错: {e}")
+
+
+def send_chat_message(conn: socket.socket, message: str):
+    """
+    发送聊天消息给客户端
+    """
+    from nebula.network.protocol import pack_var_int
+    
+    try:
+        packet = bytearray()
+        packet.append(0x0F)  # Chat Message 包 ID
+        
+        # 构建 JSON 格式的聊天消息
+        json_msg = f'{{"text": "{message}"}}'
+        msg_bytes = json_msg.encode('utf-8')
+        
+        packet.extend(pack_var_int(len(msg_bytes)))
+        packet.extend(msg_bytes)
+        packet.append(0x00)  # 位置: 0 = 聊天框
+        
+        # 发送
+        conn.send(pack_var_int(len(packet)) + bytes(packet))
+    except Exception as e:
+        log_error(f"Error sending chat message: {e}")
+
+
+def broadcast_chat_message(message: str, exclude_username: str = None):
+    """
+    广播聊天消息给所有在线玩家
+    """
+    try:
+        from nebula.player.player_manager import get_player_manager
+        player_manager = get_player_manager()
+        if player_manager:
+            for username, player in player_manager.players.items():
+                if username != exclude_username and hasattr(player, 'conn') and player.conn:
+                    try:
+                        send_chat_message(player.conn, message)
+                    except Exception as e:
+                        log_error(f"Error sending chat to {username}: {e}")
+    except Exception as e:
+        log_error(f"Error broadcasting chat message: {e}")
+
+
+def handle_tab_complete(conn: socket.socket, packet_data: bytes):
+    """
+    处理 Tab 补全请求 (0x14)
+    CPacketTabComplete 结构: message(string), hasTargetBlock(bool), hasBlockPos(bool), targetBlock(BlockPos, optional)
+    返回 SPacketTabComplete (0x0E): count(varint), suggestions[string]
+    """
+    try:
+        from nebula.network.packet_utils import read_var_int_from_bytes
+        
+        offset = 1  # 跳过 packet_id
+        
+        # 解析 message (string)
+        msg_length, offset = read_var_int_from_bytes(packet_data, offset)
+        text = ""
+        if msg_length > 0 and len(packet_data) >= offset + msg_length:
+            text = packet_data[offset:offset+msg_length].decode('utf-8')
+            offset += msg_length
+        
+        # 跳过 hasTargetBlock, hasBlockPos, targetBlock (我们不需要这些)
+        # hasTargetBlock = packet_data[offset] if offset < len(packet_data) else 0
+        # offset += 1
+        # hasBlockPos = packet_data[offset] if offset < len(packet_data) else 0
+        # offset += 1
+        # if hasBlockPos and offset + 8 <= len(packet_data):
+        #     offset += 8  # BlockPos (8 bytes)
+        
+        # 可用命令列表
+        available_commands = [
+            "time",
+            "time day",
+            "time night",
+            "time noon",
+            "time midnight",
+            "help"
+        ]
+        
+        # 根据输入过滤命令
+        suggestions = []
+        if text.startswith('/'):
+            cmd_input = text[1:]  # 去掉开头的 /
+            for cmd in available_commands:
+                if cmd.startswith(cmd_input):
+                    suggestions.append('/' + cmd)
+        
+        # 发送 Tab-Complete 响应 (0x0E) - SPacketTabComplete
+        response = bytearray()
+        response.append(0x0E)  # Tab-Complete 响应包 ID
+        
+        # 建议数量 (varint)
+        response.extend(pack_var_int(len(suggestions)))
+        
+        # 每个建议 (string)
+        for suggestion in suggestions:
+            suggestion_bytes = suggestion.encode('utf-8')
+            response.extend(pack_var_int(len(suggestion_bytes)))
+            response.extend(suggestion_bytes)
+        
+        # 发送
+        full_response = pack_var_int(len(response)) + bytes(response)
+        total_sent = 0
+        while total_sent < len(full_response):
+            sent = conn.send(full_response[total_sent:])
+            if sent == 0:
+                raise ConnectionError("Socket connection broken")
+            total_sent += sent
+        
+        log_info(f"Tab complete for '{text}': {suggestions}")
+        
+    except Exception as e:
+        log_error(f"Error handling tab complete: {e}")
 
 
 def decode_block_pos(pos: int) -> tuple:

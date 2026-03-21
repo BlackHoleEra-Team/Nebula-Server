@@ -25,17 +25,46 @@ def console_handler():
     def cmd_help():
         """显示帮助信息"""
         log_info("Available commands:")
-        # 收集每个函数的主命令名和描述
-        items = []
-        for func, desc in command_descriptions.items():
-            # 找出这个函数的所有别名
-            aliases = [name for name, f in commands.items() if f == func]
-            primary = aliases[0]  # 取第一个作为主命令名
-            alias_str = f" (aliases: {', '.join(aliases[1:])})" if len(aliases) > 1 else ""
-            items.append((primary, desc + alias_str))
         # 按命令名称排序输出
-        for primary, desc in sorted(items):
-            log_info(f"  {primary:<12} - {desc}")
+        for cmd_name in sorted(command_descriptions.keys()):
+            desc = command_descriptions[cmd_name]
+            # 找出这个命令的所有别名
+            aliases = [name for name, f in commands.items() if name != cmd_name and f == commands.get(cmd_name)]
+            alias_str = f" (aliases: {', '.join(aliases)})" if aliases else ""
+            log_info(f"  {cmd_name:<12} - {desc}{alias_str}")
+
+    def cmd_time(args):
+        """查看或设置世界时间"""
+        from nebula.world.world_manager import get_world_manager
+        world_manager = get_world_manager()
+        
+        if not args:
+            # 显示当前时间
+            current_time = int(world_manager.world_time) if world_manager else 6000
+            log_info(f"Current time: {current_time} (0=sunrise, 6000=noon, 12000=sunset, 18000=midnight)")
+            return
+        
+        # 设置时间
+        time_arg = args[0].lower()
+        if time_arg == 'day':
+            new_time = 1000
+        elif time_arg == 'night':
+            new_time = 13000
+        elif time_arg == 'noon':
+            new_time = 6000
+        elif time_arg == 'midnight':
+            new_time = 18000
+        else:
+            try:
+                new_time = int(time_arg)
+            except ValueError:
+                log_info("Usage: time [day|night|noon|midnight|<number>]")
+                return
+        
+        if world_manager:
+            world_manager.world_time = new_time % 24000
+            world_manager.broadcast_time_update()
+            log_info(f"Time set to: {new_time}")
 
     # 命令映射表
     commands = {
@@ -47,11 +76,12 @@ def console_handler():
         "stop": stop_server,
     }
 
-    # 命令描述映射表
+    # 命令描述映射表 - 使用命令名作为key，而不是函数
     command_descriptions = {
-        cmd_version: "Display server version and compatible Minecraft client version",
-        cmd_help: "Display this help message",
-        stop_server: "Stop the server",
+        "version": "Display server version and compatible Minecraft client version",
+        "help": "Display this help message",
+        "stop": "Stop the server",
+        "time": "Show or set world time (time [day|night|noon|midnight|<number>])",
     }
 
     # 主循环
@@ -59,10 +89,18 @@ def console_handler():
         if not server_state.is_running():
             break
         try:
-            cmd = input("> ")
-            if not cmd:  # 空输入直接忽略
+            cmd_line = input("> ")
+            if not cmd_line:  # 空输入直接忽略
                 continue
-            if cmd in commands:
+            
+            # 解析命令和参数
+            parts = cmd_line.split()
+            cmd = parts[0]
+            args = parts[1:] if len(parts) > 1 else []
+            
+            if cmd == "time":
+                cmd_time(args)
+            elif cmd in commands:
                 commands[cmd]()
             else:
                 log_info("Unknown command. Type 'help' for list.")

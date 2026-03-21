@@ -18,8 +18,11 @@ def read_var_int(socket_conn: socket.socket) -> int:
             if not byte_data:
                 raise ConnectionError("Connection closed while reading VarInt")
             byte = byte_data[0]
-        except (socket.timeout, BlockingIOError):
+        except socket.timeout:
             continue
+        except BlockingIOError:
+            # 非阻塞模式下没有数据，返回 -1 表示无数据
+            return -1
         result |= (byte & 0x7F) << shift
         shift += 7
         if not (byte & 0x80):

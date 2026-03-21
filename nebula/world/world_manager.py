@@ -33,6 +33,10 @@ class WorldManager:
         from nebula.world.terrain_generator import TerrainGenerator
         self.terrain_generator = TerrainGenerator(seed=12345)  # 使用固定种子以便测试
         
+        # 世界时间 (0-24000)
+        self.world_time = 6000  # 默认正午
+        self.day_time = 6000
+        
         # 初始化世界
         self._init_world()
     
@@ -334,6 +338,23 @@ class WorldManager:
             self._save_chunk(chunk)
         
         log_info(f"Saved {len(self.loaded_chunks)} chunks")
+    
+    def broadcast_time_update(self):
+        """广播时间更新给所有在线玩家"""
+        from nebula.player.player_manager import get_player_manager
+        from nebula.network.protocol import send_time_update
+        
+        try:
+            player_manager = get_player_manager()
+            if player_manager:
+                for username, player in player_manager.players.items():
+                    if hasattr(player, 'conn') and player.conn:
+                        try:
+                            send_time_update(player.conn, self.world_time, self.day_time)
+                        except Exception as e:
+                            log_error(f"Error sending time update to {username}: {e}")
+        except Exception as e:
+            log_error(f"Error broadcasting time update: {e}")
 
 
 # 全局世界管理器实例

@@ -6,6 +6,7 @@ Nebula Minecraft Server 1.12.2
 import socket
 import threading
 import sys
+import time
 
 from nebula.core.constants import VERSION, MINECRAFT_VERSION_NAME, PROTOCOL_VERSION
 from nebula.eula import first_start
@@ -18,6 +19,9 @@ from nebula.util.state import server_state
 
 def start_server():
     """启动服务器"""
+    # 记录启动开始时间
+    start_time = time.time()
+    
     # 初始化日志系统
     setup_logging()
     
@@ -48,9 +52,12 @@ def start_server():
         server_socket.listen(5)
         server_socket.settimeout(1)
         
+        # 计算启动耗时
+        startup_time = time.time() - start_time
+        
         log_info("")
+        log_info(f"Done ({startup_time:.3f}s)! For help, type \"help\"")
         log_info(f"Server is running on {HOST}:{PORT}")
-        log_info("Type 'help' for available commands")
         log_info("")
         
         # 6. 启动控制台线程

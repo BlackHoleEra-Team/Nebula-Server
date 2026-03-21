@@ -421,6 +421,7 @@ def send_chunk_data(conn: socket.socket, chunk: Chunk):
     """
     发送真实区块数据
     参考 Minecraft 1.12.2 的 SPacketChunkData 实现
+    优化：确保数据完整性，避免客户端渲染问题
     """
     try:
         packet = bytearray()
@@ -451,14 +452,17 @@ def send_chunk_data(conn: socket.socket, chunk: Chunk):
                 section_block_data = section.get_block_data()
                 chunk_data.extend(section_block_data)
                 
-                # Block light (2048 bytes)
-                chunk_data.extend(bytes(section.block_light))
+                # Block light (2048 bytes) - 确保不为空
+                block_light = bytes(section.block_light) if section.block_light else bytes(2048)
+                chunk_data.extend(block_light)
                 
-                # Sky light (2048 bytes) - 只在主世界
-                chunk_data.extend(bytes(section.sky_light))
+                # Sky light (2048 bytes) - 确保不为空，主世界需要满光照
+                sky_light = bytes(section.sky_light) if section.sky_light else bytes([0xFF] * 2048)
+                chunk_data.extend(sky_light)
         
-        # Biome数据 (256字节)
-        chunk_data.extend(bytes(chunk.biomes))
+        # Biome数据 (256字节) - 确保不为空
+        biomes = bytes(chunk.biomes) if chunk.biomes else bytes([1] * 256)
+        chunk_data.extend(biomes)
         
         # Chunk大小 (VarInt32)
         packet.extend(pack_var_int(len(chunk_data)))
@@ -470,17 +474,26 @@ def send_chunk_data(conn: socket.socket, chunk: Chunk):
         packet.extend(pack_var_int(0))
         
         # 发送：包长度(varint) + 完整包
-        conn.send(pack_var_int(len(packet)) + bytes(packet))
+        full_packet = pack_var_int(len(packet)) + bytes(packet)
+        
+        # 确保完整发送（TCP可能分包）
+        total_sent = 0
+        while total_sent < len(full_packet):
+            sent = conn.send(full_packet[total_sent:])
+            if sent == 0:
+                raise ConnectionError("Socket connection broken")
+            total_sent += sent
         
         # 计算实际发送的区块段数量
         section_count = bin(section_mask).count('1')
-        log_info(f"Sent Chunk Data: ({chunk.chunk_x}, {chunk.chunk_z}), mask={section_mask:04x}, sections={section_count}, chunk_data_size={len(chunk_data)}, total_size={len(packet)}")
+        if section_count > 0:
+            log_info(f"Sent Chunk ({chunk.chunk_x}, {chunk.chunk_z}): sections={section_count}, size={len(full_packet)} bytes")
         
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
         # 客户端已断开连接，这是正常的，不需要记录为错误
         pass
     except Exception as e:
-        log_error(f"Error sending chunk data: {e}")
+        log_error(f"Error sending chunk ({chunk.chunk_x}, {chunk.chunk_z}): {e}")
 
 
 def send_block_change(conn: socket.socket, x: int, y: int, z: int, block_state: int):
