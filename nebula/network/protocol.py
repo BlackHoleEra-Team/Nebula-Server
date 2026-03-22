@@ -271,6 +271,59 @@ def send_player_abilities(conn: socket.socket, creative_mode: bool = True, flyin
         log_error(f"Error sending player abilities: {e}")
 
 
+def send_change_game_state(conn: socket.socket, state: int, value: float):
+    """
+    发送Change Game State包 (0x1E)
+    用于改变游戏状态，如游戏模式、天气等
+    state=3 表示改变游戏模式，value=游戏模式ID (0=生存, 1=创造, 2=冒险, 3=旁观)
+    """
+    try:
+        packet = bytearray()
+        packet.append(0x1E)  # Change Game State包ID
+        
+        # State (byte)
+        packet.append(state & 0xFF)
+        
+        # Value (float)
+        packet.extend(struct.pack('>f', value))
+        
+        conn.send(pack_var_int(len(packet)) + bytes(packet))
+        log_info(f"Sent Change Game State: state={state}, value={value}")
+        
+    except Exception as e:
+        log_error(f"Error sending change game state: {e}")
+
+
+def set_player_gamemode(conn: socket.socket, gamemode: int):
+    """
+    设置玩家游戏模式
+    0=生存, 1=创造, 2=冒险, 3=旁观
+    参考原版 Minecraft 1.12.2 的 EntityPlayerMP.setGameType
+    """
+    try:
+        # 1. 发送 Change Game State 包 (state=3 表示改变游戏模式)
+        send_change_game_state(conn, 3, float(gamemode))
+        
+        # 2. 根据游戏模式设置玩家能力
+        if gamemode == 0:  # 生存模式
+            send_player_abilities(conn, creative_mode=False, flying=False, 
+                                allow_flying=False, invulnerable=False)
+        elif gamemode == 1:  # 创造模式
+            send_player_abilities(conn, creative_mode=True, flying=True, 
+                                allow_flying=True, invulnerable=True)
+        elif gamemode == 2:  # 冒险模式
+            send_player_abilities(conn, creative_mode=False, flying=False, 
+                                allow_flying=False, invulnerable=False)
+        elif gamemode == 3:  # 旁观模式
+            send_player_abilities(conn, creative_mode=False, flying=True, 
+                                allow_flying=True, invulnerable=True)
+        
+        log_info(f"Set player gamemode to {gamemode}")
+        
+    except Exception as e:
+        log_error(f"Error setting player gamemode: {e}")
+
+
 # Teleport ID计数器
 teleport_id_counter = 0
 
@@ -315,24 +368,36 @@ def send_player_position_and_look(conn: socket.socket, x: float = 0.0, y: float 
         log_error(f"Error sending player position and look: {e}")
 
 
-def send_time_update(conn: socket.socket, world_age: int = 0, time_of_day: int = 6000):
+def send_time_update(conn: socket.socket, world_age: int = 0, time_of_day: int = 6000, do_daylight_cycle: bool = True):
     """
     发送Time Update包 (0x47)
     设置世界时间
     1.12.2版本使用0x47
+    
+    参考原版 SPacketTimeUpdate 实现：
+    - doDaylightCycle=true: 正常发送 time_of_day
+    - doDaylightCycle=false: 发送 -time_of_day（负数），客户端会冻结时间
     """
     try:
         packet = bytearray()
         packet.append(0x47)  # Time Update包ID (1.12.2)
         
-        # World age (long)
+        # World age (long) - 总是正常发送
         packet.extend(pack_long(world_age))
         
-        # Time of day (long)
-        packet.extend(pack_long(time_of_day))
+        # Time of day (long) - 根据 doDaylightCycle 决定是否取负数
+        if do_daylight_cycle:
+            time_to_send = time_of_day
+        else:
+            # 取负数来冻结时间（原版逻辑）
+            time_to_send = -time_of_day
+            if time_to_send == 0:
+                time_to_send = -1
+        
+        packet.extend(pack_long(time_to_send))
         
         conn.send(pack_var_int(len(packet)) + bytes(packet))
-        log_info(f"Sent Time Update: age={world_age}, time={time_of_day}")
+        log_info(f"Sent Time Update: age={world_age}, time={time_to_send} (daylight={do_daylight_cycle})")
         
     except Exception as e:
         log_error(f"Error sending time update: {e}")

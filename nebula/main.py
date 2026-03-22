@@ -64,7 +64,31 @@ def start_server():
         console_thread = threading.Thread(target=console_handler, daemon=True)
         console_thread.start()
         
-        # 7. 主循环
+        # 7. 启动游戏 tick 线程（时间流逝）
+        def game_tick_loop():
+            """游戏主循环 - 处理时间流逝（参考原版 Minecraft 逻辑）"""
+            from nebula.world.world_manager import get_world_manager
+            tick_count = 0
+            while server_state.is_running():
+                time.sleep(0.05)  # 20 ticks per second
+                world_manager = get_world_manager()
+                if world_manager:
+                    # 每 tick 增加总游戏时间（总是增加）
+                    world_manager.world_total_time += 1
+                    
+                    # 日夜循环时间总是增加（冻结通过发送负数实现，而不是停止增加）
+                    world_manager.world_time = (world_manager.world_time + 1) % 24000
+                    
+                    # 每 20 ticks (1秒) 广播一次时间更新
+                    tick_count += 1
+                    if tick_count >= 20:
+                        world_manager.broadcast_time_update()
+                        tick_count = 0
+        
+        tick_thread = threading.Thread(target=game_tick_loop, daemon=True)
+        tick_thread.start()
+        
+        # 8. 主循环
         while server_state.is_running():
             try:
                 conn, addr = server_socket.accept()
@@ -84,6 +108,13 @@ def start_server():
     except Exception as e:
         log_error(f"Server error: {e}")
     finally:
+        # 保存世界数据
+        from nebula.world.world_manager import get_world_manager
+        world_manager = get_world_manager()
+        if world_manager:
+            log_info("Saving world data...")
+            world_manager.save_all()
+        
         server_socket.close()
         log_info("Server stopped.")
 

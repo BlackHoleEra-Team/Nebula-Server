@@ -43,6 +43,60 @@ class PlayerManager:
         """通过实体ID获取玩家"""
         return self.players_by_entity.get(entity_id)
     
+    def resolve_selector(self, selector: str, executor_username: str = None, 
+                        reference_pos: tuple = None) -> list:
+        """
+        解析目标选择器
+        @s - 执行者自己
+        @p - 最近的玩家
+        @a - 所有玩家
+        @r - 随机玩家
+        
+        返回: Player 对象列表
+        """
+        import random
+        import math
+        
+        selector = selector.lower().strip()
+        
+        # @s - 执行者自己
+        if selector == '@s':
+            if executor_username:
+                player = self.get_player(executor_username)
+                return [player] if player else []
+            return []
+        
+        # @a - 所有玩家
+        if selector == '@a':
+            return list(self.players.values())
+        
+        # @r - 随机玩家
+        if selector == '@r':
+            if not self.players:
+                return []
+            return [random.choice(list(self.players.values()))]
+        
+        # @p - 最近的玩家
+        if selector == '@p':
+            if not self.players or not reference_pos:
+                return []
+            
+            ref_x, ref_y, ref_z = reference_pos
+            closest_player = None
+            closest_distance = float('inf')
+            
+            for player in self.players.values():
+                dist = math.sqrt((player.x - ref_x)**2 + (player.y - ref_y)**2 + (player.z - ref_z)**2)
+                if dist < closest_distance:
+                    closest_distance = dist
+                    closest_player = player
+            
+            return [closest_player] if closest_player else []
+        
+        # 不是选择器，当作普通玩家名处理
+        player = self.get_player(selector)
+        return [player] if player else []
+    
     def update_player_position(self, username: str, x: float, y: float, z: float, 
                                yaw: float = None, pitch: float = None, on_ground: bool = True):
         """更新玩家位置"""

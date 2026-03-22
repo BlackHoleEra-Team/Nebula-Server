@@ -327,11 +327,16 @@ class Chunk:
         return self.sections[section_index].get_block(x, local_y, z)
     
     def get_section_mask(self) -> int:
-        """获取存在的区块段位掩码"""
+        """获取存在的区块段位掩码
+        原版逻辑：只包含实际有方块的 section，不填充空气 section
+        """
         mask = 0
+        
+        # 只包含实际有方块（非空）的 section
         for i, section in self.sections.items():
             if not section.is_empty():
                 mask |= (1 << i)
+        
         return mask
     
     def get_chunk_data(self, has_sky_light: bool = True) -> bytes:
@@ -392,8 +397,8 @@ class Chunk:
         """
         from nebula.world.terrain_generator import TerrainGenerator
         
-        # 生成该区块的所有方块
-        blocks = terrain_gen.generate_chunk_column(self.chunk_x, self.chunk_z)
+        # 生成该区块的所有方块和高度图
+        blocks, heightmap_data = terrain_gen.generate_chunk_column(self.chunk_x, self.chunk_z)
         
         # 设置方块
         for local_x, y, local_z, block_state in blocks:
@@ -403,16 +408,19 @@ class Chunk:
                 if section_y in self.sections:
                     self.sections[section_y].set_block(local_x, local_y, local_z, block_state)
         
-        # 设置生物群系
+        # 从高度图提取生物群系信息
         for x in range(16):
             for z in range(16):
-                world_x = self.chunk_x * 16 + x
-                world_z = self.chunk_z * 16 + z
-                height = terrain_gen.get_height(world_x, world_z)
-                biome = terrain_gen.get_biome(world_x, world_z, height)
+                idx = z * 16 + x
+                height, noise_val, biome = heightmap_data[idx]
                 # 将生物群系名称转换为 ID
                 biome_id = self._biome_name_to_id(biome)
                 self.biomes[z * 16 + x] = biome_id
+        
+        # 应用植被装饰
+        if hasattr(terrain_gen, 'enable_decoration') and terrain_gen.enable_decoration:
+            if hasattr(terrain_gen, 'decorator'):
+                terrain_gen.decorator.decorate_chunk(self, self.chunk_x, self.chunk_z, heightmap_data)
         
         self.is_modified = True
         log_info(f"Generated realistic terrain for chunk ({self.chunk_x}, {self.chunk_z})")
@@ -421,6 +429,7 @@ class Chunk:
         """将生物群系名称转换为 ID"""
         biome_map = {
             "ocean": 0,
+            "deep_ocean": 24,
             "plains": 1,
             "desert": 2,
             "mountains": 3,
@@ -432,7 +441,12 @@ class Chunk:
             "jungle": 21,
             "savanna": 35,
             "snowy_tundra": 12,
-            "snowy_mountains": 13,
+            "ice_mountains": 13,  # 冰山（1.12.2名称，1.13+改为snowy_mountains）
             "snowy_taiga": 30,
+            "hills": 3,  # 使用 mountains ID
+            "plateau": 36,  # 使用 savanna_plateau ID
+            # 自定义干旱生物群系 - 映射到相近的 vanilla 生物群系
+            "arid_gobi": 2,  # 使用 desert ID（客户端显示为沙漠）
+            "dry_lakebed": 16,  # 使用 beach ID（客户端显示为海滩）
         }
         return biome_map.get(biome_name, 1)  # 默认为草原

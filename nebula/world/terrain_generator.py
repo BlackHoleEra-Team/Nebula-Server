@@ -3,12 +3,25 @@
 使用 OpenSimplex2 + FBM + Domain Warping + Height Curve
 支持 1024 格高度上限
 阶段三：水力侵蚀系统
+阶段四：喀斯特地貌系统
+阶段五：植被装饰系统
 """
 
 import math
 import random
 from typing import Tuple, List, Optional, Dict
 from nebula.logging.logging_utils import log_info, log_error
+
+# 导入喀斯特地貌生成器
+try:
+    from nebula.world.karst_generator import KarstTerrainSystem
+    HAS_KARST = True
+except ImportError:
+    HAS_KARST = False
+    log_info("[TerrainGenerator] 喀斯特地貌系统未启用")
+
+# 导入世界装饰器
+from nebula.world.decorator import WorldDecorator
 
 # 尝试导入 Numba 加速
 try:
@@ -268,9 +281,12 @@ class HeightCurve:
         # 限制范围
         return max(5, min(self.max_height - 5, int(height)))
     
-    def get_biome_from_height(self, height: int, noise_value: float) -> str:
+    def get_biome_from_height(self, height: int, noise_value: float, moisture: float = 0.5,
+                               temperature: float = 0.5) -> str:
         """
-        根据高度和噪声值确定生物群系
+        根据高度、噪声值、湿度和温度确定生物群系
+        moisture: 湿度值 0-1，低湿度可能生成沙漠
+        temperature: 温度值 0-1，影响生物群系类型
         """
         if height < self.sea_level - 5:
             return "deep_ocean"
@@ -278,6 +294,21 @@ class HeightCurve:
             return "ocean"
         elif height < self.sea_level + 2:
             return "beach"
+        # 低海拔 + 低湿度 + 高温 = 沙漠
+        elif height < 80 and moisture < 0.3 and temperature > 0.6:
+            return "desert"
+        # 中海拔 + 低湿度 + 中温 = 干旱戈壁（雅丹地貌载体）
+        elif 60 <= height < 90 and moisture < 0.35 and 0.4 <= temperature <= 0.7:
+            return "arid_gobi"
+        # 低海拔 + 低湿度 + 低温 = 干涸湖床
+        elif height < 75 and moisture < 0.25 and temperature < 0.5:
+            return "dry_lakebed"
+        # 高海拔 + 低温 = 冰山（ice_mountains，1.12.2名称）
+        elif height >= 90 and temperature < 0.4:
+            return "ice_mountains"
+        # 高海拔 + 较平坦 = 高原
+        elif height >= 100 and abs(noise_value) < 0.3:
+            return "plateau"
         elif noise_value < self.plains_threshold:
             return "plains"
         elif noise_value < self.hills_threshold:
@@ -551,6 +582,8 @@ class TerrainGenerator:
         self.turb_noise = OpenSimplex2(seed + 5)
         self.basin_noise = OpenSimplex2(seed + 6)
         self.hill_noise = OpenSimplex2(seed + 7)
+        self.moisture_noise = OpenSimplex2(seed + 8)  # 湿度噪声（用于沙漠生成）
+        self.temperature_noise = OpenSimplex2(seed + 9)  # 温度噪声（用于生物群系多样性）
         
         # 2. FBM 分形布朗运动
         self.base_fbm = FBM(self.base_noise.noise_2d, octaves=4, 
@@ -622,6 +655,16 @@ class TerrainGenerator:
         
         # 是否启用侵蚀
         self.enable_erosion = True
+        
+        # ===== 阶段四：喀斯特地貌系统 =====
+        # 暂时禁用洞穴生成以提高性能
+        self.enable_karst = False
+        log_info("[TerrainGenerator] 喀斯特地貌系统已禁用")
+        
+        # ===== 阶段五：植被装饰系统 =====
+        self.decorator = WorldDecorator(seed=seed)
+        self.enable_decoration = True
+        log_info("[TerrainGenerator] 植被装饰系统已启用")
         
         # 高度图缓存
         self._height_cache: Dict[Tuple[int, int], List[Tuple[int, float, str]]] = {}
@@ -707,10 +750,22 @@ class TerrainGenerator:
                 # 限制高度范围
                 height = max(5, min(self.MAX_HEIGHT - 10, height))
                 
-                # 确定生物群系
-                biome = self.height_curve.get_biome_from_height(height, combined)
+                # 计算湿度和温度（用于生物群系生成）
+                moisture = self.moisture_noise.noise_2d(world_x * 0.002, world_z * 0.002)
+                moisture = moisture * 0.5 + 0.5  # 映射到 0-1
+                
+                temperature = self.temperature_noise.noise_2d(world_x * 0.002, world_z * 0.002)
+                temperature = temperature * 0.5 + 0.5  # 映射到 0-1
+                
+                # 确定生物群系（传入湿度和温度）
+                biome = self.height_curve.get_biome_from_height(height, combined, moisture, temperature)
                 
                 heightmap.append((height, combined, biome))
+        
+        # ===== 阶段四：喀斯特地貌处理 =====
+        # 在特定生物群系（如高原、山地）应用喀斯特地貌
+        if self.enable_karst:
+            heightmap = self._apply_karst_to_chunk(heightmap, chunk_x, chunk_z)
         
         # ===== 阶段三：水力侵蚀（后处理）=====
         # 注意：侵蚀在大尺度高度图上应用，然后插值到区块
@@ -931,6 +986,33 @@ class TerrainGenerator:
         heightmap = coastal_erosion.erode_coast(heightmap)
         
         # ========== 阶段五：风成与火山地貌 ==========
+        # 生成生物群系图（用于沙丘和雅丹地貌）
+        biome_map = []
+        moisture_map = []
+        for z in range(size):
+            biome_row = []
+            moisture_row = []
+            for x in range(size):
+                world_x = world_x_base + x
+                world_z = world_z_base + z
+                
+                # 计算湿度
+                moisture = self.moisture_noise.noise_2d(world_x * 0.002, world_z * 0.002)
+                moisture = moisture * 0.5 + 0.5
+                moisture_row.append(moisture)
+                
+                # 计算温度
+                temperature = self.temperature_noise.noise_2d(world_x * 0.002, world_z * 0.002)
+                temperature = temperature * 0.5 + 0.5
+                
+                # 确定生物群系（传入温度）
+                height = heightmap[z][x]
+                noise_val = self.base_noise.noise_2d(world_x * 0.001, world_z * 0.001)
+                biome = self.height_curve.get_biome_from_height(int(height), noise_val, moisture, temperature)
+                biome_row.append(biome)
+            biome_map.append(biome_row)
+            moisture_map.append(moisture_row)
+        
         # 5. 风蚀作用
         wind_direction = 45.0 + (world_x_base * 0.01) * 360
         wind_erosion = WindErosion(
@@ -941,13 +1023,13 @@ class TerrainGenerator:
             for x in range(size):
                 wind_erosion.erode(heightmap, x, z, size, size)
         
-        # 6. 沙丘生成
+        # 6. 沙丘生成（只在沙漠生物群系生成）
         dune_formation = DuneFormation(
             dune_height=3.0,
             dune_spacing=20.0,
             aridity_threshold=0.7
         )
-        heightmap = dune_formation.form_dunes(heightmap, seed=self.seed)
+        heightmap = dune_formation.form_dunes(heightmap, moisture_map, biome_map, seed=self.seed)
         
         # 7. 雅丹地貌
         yardang = YardangAlgorithm(
@@ -955,7 +1037,7 @@ class TerrainGenerator:
             yardang_spacing=15.0,
             ridge_height=2.5
         )
-        heightmap = yardang.form_yardangs(heightmap, seed=self.seed + 1)
+        heightmap = yardang.form_yardangs(heightmap, biome_map, seed=self.seed + 1)
         
         # 8. 火山锥（基于世界坐标，不是区块坐标）
         volcano_noise = self.base_noise.noise_2d(world_x_base * 0.01, world_z_base * 0.01)
@@ -999,15 +1081,20 @@ class TerrainGenerator:
         
         return heightmap
     
-    def generate_chunk_column(self, chunk_x: int, chunk_z: int) -> List[Tuple[int, int, int, int]]:
+    def generate_chunk_column(self, chunk_x: int, chunk_z: int) -> Tuple[List[Tuple[int, int, int, int]], List[Tuple[int, float, str]]]:
         """
         生成一个区块列的所有方块
-        返回: [(x, y, z, block_state), ...]
+        返回: (blocks, heightmap)
+            blocks: [(x, y, z, block_state), ...]
+            heightmap: [(height, noise, biome), ...] 用于装饰器
         """
         blocks = []
         
         # 生成高度图
         heightmap = self.generate_heightmap(chunk_x, chunk_z)
+        
+        # 预计算噪声缓存（避免重复计算）
+        noise_cache = {}
         
         for local_z in range(16):
             for local_x in range(16):
@@ -1019,14 +1106,26 @@ class TerrainGenerator:
                 max_y = max(surface_height, self.SEA_LEVEL)
                 
                 # 生成该列的方块
+                world_x = chunk_x * 16 + local_x
+                world_z = chunk_z * 16 + local_z
+                
+                # 对需要噪声的生物群系，预计算噪声值
+                if biome in ["arid_gobi", "dry_lakebed"]:
+                    cache_key = (world_x, world_z)
+                    if cache_key not in noise_cache:
+                        if biome == "arid_gobi":
+                            noise_cache[cache_key] = self.base_noise.noise_2d(world_x * 0.1, world_z * 0.1)
+                        else:  # dry_lakebed
+                            noise_cache[cache_key] = self.base_noise.noise_2d(world_x * 0.08, world_z * 0.08)
+                
                 for y in range(min(max_y + 1, 256)):
-                    block_state = self._get_block_at(y, surface_height, biome)
+                    block_state = self._get_block_at_cached(world_x, y, world_z, surface_height, biome, noise_cache)
                     if block_state != 0:
                         blocks.append((local_x, y, local_z, block_state))
         
-        return blocks
+        return blocks, heightmap
     
-    def _get_block_at(self, y: int, surface_height: int, biome: str) -> int:
+    def _get_block_at(self, x: int, y: int, z: int, surface_height: int, biome: str) -> int:
         """根据位置和生物群系返回方块类型"""
         
         # 基岩层
@@ -1056,6 +1155,46 @@ class TerrainGenerator:
                 return 12 << 4  # 沙子
             return 1 << 4  # 石头
         
+        # 沙漠
+        if biome == "desert":
+            depth = surface_height - y
+            if depth <= 3:
+                return 12 << 4  # 沙子（沙漠地表）
+            elif depth <= 6:
+                return 12 << 4  # 沙子（沙漠下层）
+            return 1 << 4  # 石头
+        
+        # 干旱戈壁 - 砂岩 + 沙砾混合（使用噪声避免条纹）
+        if biome == "arid_gobi":
+            depth = surface_height - y
+            # 使用噪声生成自然分布
+            noise_val = self.base_noise.noise_2d(x * 0.1, z * 0.1)
+            if depth <= 2:
+                # 地表：砂岩（24）或红砂岩（179）
+                if noise_val > 0.3:
+                    return 179 << 4  # 红砂岩
+                return 24 << 4  # 砂岩
+            elif depth <= 5:
+                # 下层：沙砾（13）或砂岩
+                if noise_val < -0.2:
+                    return 13 << 4  # 沙砾
+                return 24 << 4  # 砂岩
+            return 1 << 4  # 石头
+        
+        # 干涸湖床 - 黏土块 + 砂岩（使用噪声避免条纹）
+        if biome == "dry_lakebed":
+            depth = surface_height - y
+            # 使用噪声生成自然分布
+            noise_val = self.base_noise.noise_2d(x * 0.08, z * 0.08)
+            if depth <= 1:
+                return 82 << 4  # 黏土块
+            elif depth <= 4:
+                # 黏土块和砂岩混合
+                if noise_val > 0.0:
+                    return 82 << 4  # 黏土块
+                return 24 << 4  # 砂岩
+            return 1 << 4  # 石头
+        
         # 地表
         if y == surface_height:
             if biome == "plains":
@@ -1068,13 +1207,133 @@ class TerrainGenerator:
                 if y > 100:
                     return 80 << 4  # 雪
                 return 1 << 4  # 石头
+            elif biome == "ice_mountains":
+                return 80 << 4  # 雪（冰山地表全是雪）
+            elif biome == "plateau":
+                if y > 100:
+                    return 80 << 4  # 雪（高原高处有雪）
+                return 2 << 4  # 草方块
+            elif biome == "desert":
+                return 12 << 4  # 沙子
             else:
                 return 2 << 4  # 草方块
         
         # 地表以下
         depth = surface_height - y
         
-        if biome == "mountains":
+        if biome in ["mountains", "ice_mountains"]:
+            return 1 << 4  # 石头
+        elif biome == "plateau":
+            if depth <= 3:
+                return 3 << 4  # 泥土
+            return 1 << 4  # 石头
+        else:
+            if depth <= 3:
+                return 3 << 4  # 泥土
+            return 1 << 4  # 石头
+    
+    def _get_block_at_cached(self, x: int, y: int, z: int, surface_height: int, 
+                             biome: str, noise_cache: dict) -> int:
+        """带噪声缓存的方块获取方法"""
+        
+        # 基岩层
+        if y == 0:
+            return 7 << 4  # 基岩
+        
+        # 地表以上 - 检查是否需要水
+        if y > surface_height:
+            if y <= self.SEA_LEVEL:
+                return 9 << 4  # 水
+            return 0  # 空气
+        
+        # 深海/海洋底部
+        if biome in ["deep_ocean", "ocean"]:
+            depth = surface_height - y
+            if y == surface_height:
+                return 12 << 4  # 沙子（海底表面）
+            elif depth <= 3:
+                return 12 << 4  # 沙子
+            else:
+                return 1 << 4  # 石头
+        
+        # 海滩
+        if biome == "beach":
+            depth = surface_height - y
+            if depth <= 3:
+                return 12 << 4  # 沙子
+            return 1 << 4  # 石头
+        
+        # 沙漠
+        if biome == "desert":
+            depth = surface_height - y
+            if depth <= 3:
+                return 12 << 4  # 沙子（沙漠地表）
+            elif depth <= 6:
+                return 12 << 4  # 沙子（沙漠下层）
+            return 1 << 4  # 石头
+        
+        # 干旱戈壁 - 使用缓存的噪声值
+        if biome == "arid_gobi":
+            depth = surface_height - y
+            cache_key = (x, z)
+            noise_val = noise_cache.get(cache_key, 0.0)
+            if depth <= 2:
+                # 地表：砂岩（24）或红砂岩（179）
+                if noise_val > 0.3:
+                    return 179 << 4  # 红砂岩
+                return 24 << 4  # 砂岩
+            elif depth <= 5:
+                # 下层：沙砾（13）或砂岩
+                if noise_val < -0.2:
+                    return 13 << 4  # 沙砾
+                return 24 << 4  # 砂岩
+            return 1 << 4  # 石头
+        
+        # 干涸湖床 - 使用缓存的噪声值
+        if biome == "dry_lakebed":
+            depth = surface_height - y
+            cache_key = (x, z)
+            noise_val = noise_cache.get(cache_key, 0.0)
+            if depth <= 1:
+                return 82 << 4  # 黏土块
+            elif depth <= 4:
+                # 黏土块和砂岩混合
+                if noise_val > 0.0:
+                    return 82 << 4  # 黏土块
+                return 24 << 4  # 砂岩
+            return 1 << 4  # 石头
+        
+        # 地表
+        if y == surface_height:
+            if biome == "plains":
+                return 2 << 4  # 草方块
+            elif biome == "forest":
+                return 2 << 4  # 草方块
+            elif biome == "hills":
+                return 2 << 4  # 草方块
+            elif biome == "mountains":
+                if y > 100:
+                    return 80 << 4  # 雪
+                return 1 << 4  # 石头
+            elif biome == "ice_mountains":
+                return 80 << 4  # 雪（冰山地表全是雪）
+            elif biome == "plateau":
+                if y > 100:
+                    return 80 << 4  # 雪（高原高处有雪）
+                return 2 << 4  # 草方块
+            elif biome == "desert":
+                return 12 << 4  # 沙子
+            else:
+                return 2 << 4  # 草方块
+        
+        # 地表以下
+        depth = surface_height - y
+        
+        if biome in ["mountains", "ice_mountains"]:
+            return 1 << 4  # 石头
+        elif biome == "plateau":
+            if depth <= 3:
+                return 3 << 4  # 泥土
             return 1 << 4  # 石头
         else:
             if depth <= 3:
@@ -1102,11 +1361,143 @@ class TerrainGenerator:
         _, _, biome = heightmap[local_z * 16 + local_x]
         return biome
     
+    def get_noise(self, world_x: int, world_z: int) -> float:
+        """获取指定坐标的噪声值"""
+        chunk_x = world_x // 16
+        chunk_z = world_z // 16
+        local_x = world_x % 16
+        local_z = world_z % 16
+        
+        heightmap = self.generate_heightmap(chunk_x, chunk_z)
+        return heightmap[local_z * 16 + local_x][1]
+    
+    def _apply_karst_to_chunk(self, heightmap: List[Tuple[int, float, str]], 
+                              chunk_x: int, chunk_z: int) -> List[Tuple[int, float, str]]:
+        """
+        应用喀斯特地貌处理到区块
+        只在适合喀斯特地貌的生物群系（高原、山地）应用
+        """
+        if not self.enable_karst:
+            return heightmap
+        
+        # 检查当前区块是否适合喀斯特地貌（需要有足够的高原/山地）
+        # 明确排除沙漠等干旱地区
+        karst_suitable_biomes = {'mountains', 'hills', 'plateau'}
+        karst_excluded_biomes = {'desert', 'beach', 'ocean', 'deep_ocean'}
+        
+        # 如果有任何被排除的生物群系，直接跳过
+        excluded_count = sum(1 for h in heightmap if h[2] in karst_excluded_biomes)
+        if excluded_count > 128:  # 超过50%是被排除的生物群系
+            return heightmap
+        
+        suitable_count = sum(1 for h in heightmap if h[2] in karst_suitable_biomes)
+        
+        # 如果少于25%的区块适合喀斯特地貌，跳过处理
+        if suitable_count < 64:  # 256 * 0.25
+            return heightmap
+        
+        # 优化：使用概率跳过部分区块，避免每个区块都处理
+        # 基于区块坐标生成确定性随机，确保一致性
+        skip_prob = (chunk_x * 73856093 + chunk_z * 19349663) % 100 / 100
+        if skip_prob < 0.5:  # 50% 的区块跳过详细处理
+            return heightmap
+        
+        # 生成48x48区域用于喀斯特处理（需要周围区块的数据）
+        # 中心是当前区块，周围是相邻区块
+        base_heightmap = self._generate_karst_region(chunk_x, chunk_z)
+        
+        # 使用喀斯特系统处理
+        try:
+            processed_heightmap, diss_map = self.karst_system.process_chunk(
+                chunk_x, chunk_z, base_heightmap
+            )
+            
+            # 提取中心16x16区域（对应当前区块）
+            result = []
+            for local_z in range(16):
+                for local_x in range(16):
+                    idx = local_z * 16 + local_x
+                    original = heightmap[idx]
+                    # 中心区域在48x48图中的位置是 (16, 16) 到 (31, 31)
+                    new_height = processed_heightmap[16 + local_z][16 + local_x]
+                    # 保持原始噪声和生物群系
+                    result.append((new_height, original[1], original[2]))
+            
+            return result
+        except Exception as e:
+            log_error(f"[TerrainGenerator] 喀斯特地貌处理失败: {e}")
+            import traceback
+            log_error(traceback.format_exc())
+            return heightmap
+    
+    def _generate_karst_region(self, chunk_x: int, chunk_z: int) -> List[List[int]]:
+        """
+        生成48x48的区域用于喀斯特处理
+        中心是当前区块，周围是相邻区块
+        """
+        region = []
+        
+        # 生成3x3的区块区域（48x48）
+        for dz in range(-1, 2):  # -1, 0, 1
+            for local_z in range(16):
+                row = []
+                for dx in range(-1, 2):  # -1, 0, 1
+                    neighbor_chunk_x = chunk_x + dx
+                    neighbor_chunk_z = chunk_z + dz
+                    
+                    # 生成邻居区块的高度图
+                    neighbor_heightmap = self._generate_raw_heightmap(
+                        neighbor_chunk_x, neighbor_chunk_z
+                    )
+                    
+                    # 提取当前行的高度
+                    for local_x in range(16):
+                        idx = local_z * 16 + local_x
+                        row.append(neighbor_heightmap[idx][0])
+                
+                region.append(row)
+        
+        return region
+    
+    def _generate_raw_heightmap(self, chunk_x: int, chunk_z: int) -> List[Tuple[int, float, str]]:
+        """
+        生成原始高度图（不应用喀斯特和侵蚀）
+        """
+        heightmap = []
+        
+        for local_z in range(16):
+            for local_x in range(16):
+                world_x = chunk_x * 16 + local_x
+                world_z = chunk_z * 16 + local_z
+                
+                # 基础地形生成（阶段一、二）
+                height = self._generate_single_point(world_x, world_z)
+                
+                # 确定生物群系
+                turb_x, turb_z = self.turbulence.warp_coordinates(world_x, world_z)
+                warped_x, warped_z = self.warper.warp_2d(turb_x, turb_z, scale=0.002)
+                base_value = self.base_fbm.sample_2d(warped_x * 0.001, warped_z * 0.001)
+                detail_value = self.detail_fbm.sample_2d(world_x * 0.01, world_z * 0.01)
+                combined = base_value * 0.8 + detail_value * 0.2
+                
+                # 计算湿度和温度（用于生物群系生成）
+                moisture = self.moisture_noise.noise_2d(world_x * 0.002, world_z * 0.002)
+                moisture = moisture * 0.5 + 0.5  # 映射到 0-1
+                
+                temperature = self.temperature_noise.noise_2d(world_x * 0.002, world_z * 0.002)
+                temperature = temperature * 0.5 + 0.5  # 映射到 0-1
+                
+                biome = self.height_curve.get_biome_from_height(height, combined, moisture, temperature)
+                
+                heightmap.append((height, combined, biome))
+        
+        return heightmap
+    
     def get_block_at(self, world_x: int, y: int, world_z: int) -> int:
         """获取指定坐标的方块"""
         height = self.get_height(world_x, world_z)
         biome = self.get_biome(world_x, world_z)
-        return self._get_block_at(y, height, biome)
+        return self._get_block_at(world_x, y, world_z, height, biome)
 
 
 class D8FlowDirection:
@@ -1840,10 +2231,11 @@ class DuneFormation:
     
     def form_dunes(self, heightmap: List[List[float]],
                    moisture_map: Optional[List[List[float]]] = None,
+                   biome_map: Optional[List[List[str]]] = None,
                    seed: int = 12345) -> List[List[float]]:
         """
         在沙漠区域生成沙丘链
-        只在低海拔、低坡度、干旱区域生成，避免在普通平原产生规则图案
+        只在沙漠生物群系、低海拔、低坡度、干旱区域生成
         """
         width = len(heightmap)
         height = len(heightmap[0])
@@ -1854,6 +2246,10 @@ class DuneFormation:
         for x in range(width):
             for z in range(height):
                 current_h = heightmap[x][z]
+                
+                # 0. 生物群系检查：只在沙漠生成沙丘
+                if biome_map and biome_map[x][z] != 'desert':
+                    continue
                 
                 # 1. 高度检查：在低海拔区域生成沙丘（40-100格，覆盖更多地形）
                 if current_h > 100 or current_h < 40:
@@ -1877,18 +2273,14 @@ class DuneFormation:
                     if avg_slope > 2.0:
                         continue
                 
-                # 3. 湿度检查
+                # 3. 湿度检查（可选，如果提供了湿度图）
                 if moisture_map:
                     moisture = moisture_map[x][z]
-                else:
-                    # 使用噪声模拟湿度，但添加更多变化避免规则图案
-                    moisture = dune_noise.noise_2d(x * 0.005, z * 0.005) * 0.5 + 0.5
-                    # 添加高频噪声增加随机性
-                    moisture += dune_noise.noise_2d(x * 0.02, z * 0.02) * 0.2
-                    moisture = max(0.0, min(1.0, moisture))
+                    # 只在干旱区域生成沙丘
+                    if moisture > 0.35:
+                        continue
                 
-                # 只在干旱区域生成沙丘（阈值基于实际噪声范围 0.2-0.5）
-                if moisture > 0.35:
+                # 生成沙丘
                     # 使用非周期性噪声生成沙丘，避免规则图案
                     dune_pattern = dune_noise.noise_2d(
                         x * 0.08 + seed * 0.1,
@@ -1930,11 +2322,15 @@ class YardangAlgorithm:
         self.yardang_spacing = yardang_spacing
         self.ridge_height = ridge_height
     
+    # 支持雅丹地貌的生物群系（干旱环境）
+    YARDANG_BIOMES = {'desert', 'arid_gobi', 'dry_lakebed'}
+    
     def form_yardangs(self, heightmap: List[List[float]],
+                      biome_map: Optional[List[List[str]]] = None,
                       seed: int = 12345) -> List[List[float]]:
         """
         生成雅丹地貌（垄槽相间）
-        只在特定海拔和干旱区域生成，避免在普通平原产生规则图案
+        在沙漠、干旱戈壁、干涸湖床等干旱生物群系生成
         """
         width = len(heightmap)
         height = len(heightmap[0])
@@ -1949,6 +2345,10 @@ class YardangAlgorithm:
         for x in range(width):
             for z in range(height):
                 current_h = heightmap[x][z]
+                
+                # 0. 生物群系检查：在支持的干旱生物群系生成雅丹地貌
+                if biome_map and biome_map[x][z] not in self.YARDANG_BIOMES:
+                    continue
                 
                 # 1. 高度检查：雅丹地貌在中低海拔（45-95格，覆盖更多地形）
                 if current_h < 45 or current_h > 95:

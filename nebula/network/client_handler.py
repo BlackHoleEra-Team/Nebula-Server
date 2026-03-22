@@ -18,7 +18,7 @@ from nebula.network.protocol import (
     handle_login_start, send_login_success, send_join_game, send_spawn_position,
     send_player_abilities, send_player_position_and_look, send_time_update,
     send_keep_alive, send_empty_chunk, send_chunk_data, send_block_change,
-    read_var_int, pack_var_int
+    set_player_gamemode, read_var_int, pack_var_int
 )
 from nebula.network.packet_utils import read_exact_bytes
 from nebula.world.world_manager import get_world_manager
@@ -121,10 +121,11 @@ def enter_play_phase(conn: socket.socket, username: str, player_uuid: str):
     
     # 1. 发送Join Game包
     entity_id = random.randint(1000, 9999)
-    send_join_game(conn, entity_id, gamemode=1, dimension=0)  # 创造模式，主世界
+    send_join_game(conn, entity_id, gamemode=0, dimension=0)  # 生存模式，主世界
     
     # 2. 注册玩家
     player = player_manager.add_player(username, entity_id, conn)
+    player.gamemode = 0  # 默认生存模式
     
     # 3. 加载玩家数据（位置等）
     player_data = player_data_manager.load_player_data(player_uuid)
@@ -136,15 +137,23 @@ def enter_play_phase(conn: socket.socket, username: str, player_uuid: str):
         player.yaw = player_data.get('yaw', 0.0)
         player.pitch = player_data.get('pitch', 0.0)
         player.is_flying = player_data.get('is_flying', False)
-        log_info(f"Loaded player position for {username}: ({player.x}, {player.y}, {player.z}), flying={player.is_flying}")
+        player.gamemode = player_data.get('gamemode', 0)  # 恢复游戏模式
+        log_info(f"Loaded player position for {username}: ({player.x}, {player.y}, {player.z}), flying={player.is_flying}, gamemode={player.gamemode}")
     else:
         log_info(f"No saved data for {username}, using default position")
     
     # 4. 发送出生点
     send_spawn_position(conn, x=0, y=64, z=0)
     
-    # 5. 发送玩家能力（飞行）
-    send_player_abilities(conn, creative_mode=True, flying=player.is_flying, allow_flying=True)
+    # 5. 发送玩家能力（根据游戏模式）
+    if player.gamemode == 0:  # 生存模式
+        send_player_abilities(conn, creative_mode=False, flying=False, allow_flying=False, invulnerable=False)
+    elif player.gamemode == 1:  # 创造模式
+        send_player_abilities(conn, creative_mode=True, flying=player.is_flying, allow_flying=True, invulnerable=True)
+    elif player.gamemode == 2:  # 冒险模式
+        send_player_abilities(conn, creative_mode=False, flying=False, allow_flying=False, invulnerable=False)
+    elif player.gamemode == 3:  # 旁观模式
+        send_player_abilities(conn, creative_mode=False, flying=True, allow_flying=True, invulnerable=True)
     
     # 6. 发送玩家位置和视角（等待Teleport Confirm）
     send_player_position_and_look(conn, x=player.x, y=player.y, z=player.z, yaw=player.yaw, pitch=player.pitch)
@@ -283,8 +292,8 @@ def keep_alive_loop(conn: socket.socket, username: str, player_manager=None, wor
     # 待加载的区块队列（从初始加载传递过来）
     pending_chunks_list = pending_chunks if pending_chunks is not None else []
     
-    # 每 tick 加载的区块数量（减少以避免阻塞命令）
-    CHUNKS_PER_TICK = 5
+    # 每 tick 加载的区块数量（增加以加快加载速度）
+    CHUNKS_PER_TICK = 49
     
     # 使用 select 实现非阻塞 I/O
     conn.setblocking(False)
@@ -496,7 +505,9 @@ def handle_command(conn: socket.socket, username: str, message: str, world_manag
             if len(args) == 0:
                 # 查询当前时间
                 current_time = int(world_manager.world_time) if world_manager else 6000
+                total_ticks = int(world_manager.world_total_time) if world_manager else 0
                 send_chat_message(conn, f"当前时间: {current_time} (0=日出, 6000=正午, 12000=日落, 18000=午夜)")
+                send_chat_message(conn, f"总游戏刻: {total_ticks}")
             else:
                 # 设置时间
                 try:
@@ -519,6 +530,178 @@ def handle_command(conn: socket.socket, username: str, message: str, world_manag
                 except ValueError:
                     send_chat_message(conn, "用法: /time [day|night|noon|midnight|<数值>]")
         
+        elif command == '/gamerule':
+            if not world_manager:
+                send_chat_message(conn, "世界未初始化")
+                return
+            
+            if len(args) == 0:
+                # 显示所有游戏规则
+                send_chat_message(conn, "游戏规则:")
+                for rule, value in world_manager.game_rules.items():
+                    send_chat_message(conn, f"  {rule}: {value}")
+            elif len(args) == 1:
+                # 显示特定规则
+                rule = args[0]
+                if rule in world_manager.game_rules:
+                    send_chat_message(conn, f"{rule}: {world_manager.game_rules[rule]}")
+                else:
+                    send_chat_message(conn, f"未知游戏规则: {rule}")
+            else:
+                # 设置规则
+                rule = args[0]
+                value = args[1].lower()
+                
+                if rule not in world_manager.game_rules:
+                    send_chat_message(conn, f"未知游戏规则: {rule}")
+                    return
+                
+                # 转换值为布尔值或保持字符串
+                if value in ('true', '1', 'yes'):
+                    world_manager.game_rules[rule] = True
+                elif value in ('false', '0', 'no'):
+                    world_manager.game_rules[rule] = False
+                else:
+                    world_manager.game_rules[rule] = value
+                
+                send_chat_message(conn, f"游戏规则 {rule} 设置为: {world_manager.game_rules[rule]}")
+                # 立即广播时间更新（如果修改了 doDaylightCycle）
+                if rule == "doDaylightCycle":
+                    world_manager.broadcast_time_update()
+        
+        elif command == '/gamemode' or command == '/gm':
+            if len(args) == 0:
+                # 显示当前游戏模式
+                player = get_player_manager().get_player(username)
+                if player:
+                    mode_names = {0: "生存", 1: "创造", 2: "冒险", 3: "旁观"}
+                    current_mode = mode_names.get(player.gamemode, "未知")
+                    send_chat_message(conn, f"当前游戏模式: {current_mode} ({player.gamemode})")
+                else:
+                    send_chat_message(conn, "无法获取玩家信息")
+            else:
+                # 解析游戏模式
+                mode_arg = args[0].lower()
+                mode_map = {
+                    '0': 0, 's': 0, 'survival': 0, '生存': 0,
+                    '1': 1, 'c': 1, 'creative': 1, '创造': 1,
+                    '2': 2, 'a': 2, 'adventure': 2, '冒险': 2,
+                    '3': 3, 'sp': 3, 'spectator': 3, '旁观': 3,
+                }
+                
+                if mode_arg in mode_map:
+                    new_gamemode = mode_map[mode_arg]
+                    player = get_player_manager().get_player(username)
+                    if player:
+                        player.gamemode = new_gamemode
+                        set_player_gamemode(conn, new_gamemode)
+                        mode_names = {0: "生存", 1: "创造", 2: "冒险", 3: "旁观"}
+                        send_chat_message(conn, f"游戏模式已设置为: {mode_names[new_gamemode]}")
+                    else:
+                        send_chat_message(conn, "无法获取玩家信息")
+                else:
+                    send_chat_message(conn, "用法: /gamemode <0|1|2|3|s|c|a|sp|survival|creative|adventure|spectator>")
+        
+        elif command == '/tp' or command == '/teleport':
+            player_manager = get_player_manager()
+            player = player_manager.get_player(username)
+            if not player:
+                send_chat_message(conn, "无法获取玩家信息")
+                return
+            
+            if len(args) == 0:
+                send_chat_message(conn, "用法: /tp <目标> 或 /tp <x> <y> <z> 或 /tp <目标> <目的地>")
+            elif len(args) == 1:
+                # 传送到目标（支持选择器）
+                target_selector = args[0]
+                targets = player_manager.resolve_selector(target_selector, username, (player.x, player.y, player.z))
+                
+                if targets:
+                    target = targets[0]  # 取第一个目标
+                    player.x = target.x
+                    player.y = target.y
+                    player.z = target.z
+                    send_player_position_and_look(conn, player.x, player.y, player.z, player.yaw, player.pitch)
+                    target_name = target.username if hasattr(target, 'username') else str(target)
+                    send_chat_message(conn, f"已传送到 {target_name} 的位置")
+                else:
+                    send_chat_message(conn, f"找不到目标: {target_selector}")
+            elif len(args) == 2:
+                # 可能是: /tp <玩家> <玩家2> 或 /tp <玩家> ~ ~ ~
+                # 检查第二个参数是否是数字（相对坐标）
+                if args[1] in ('~', '^') or _is_number(args[1]):
+                    # 这是坐标形式，需要4个参数，当前只有2个，报错
+                    send_chat_message(conn, "用法: /tp <目标> <x> <y> <z> - 需要完整坐标")
+                    return
+                
+                # 传送目标到目的地（支持选择器）
+                source_selector = args[0]
+                dest_selector = args[1]
+                
+                sources = player_manager.resolve_selector(source_selector, username, (player.x, player.y, player.z))
+                dests = player_manager.resolve_selector(dest_selector, username, (player.x, player.y, player.z))
+                
+                if not sources:
+                    send_chat_message(conn, f"找不到传送源: {source_selector}")
+                    return
+                if not dests:
+                    send_chat_message(conn, f"找不到传送目标: {dest_selector}")
+                    return
+                
+                dest = dests[0]
+                count = 0
+                for source in sources:
+                    source.x = dest.x
+                    source.y = dest.y
+                    source.z = dest.z
+                    if source.conn:
+                        send_player_position_and_look(source.conn, source.x, source.y, source.z, source.yaw, source.pitch)
+                    count += 1
+                
+                dest_name = dest.username if hasattr(dest, 'username') else str(dest)
+                send_chat_message(conn, f"已将 {count} 个玩家传送到 {dest_name} 的位置")
+            elif len(args) == 3:
+                # 传送到指定坐标
+                try:
+                    x = float(args[0])
+                    y = float(args[1])
+                    z = float(args[2])
+                    player.x = x
+                    player.y = y
+                    player.z = z
+                    send_player_position_and_look(conn, player.x, player.y, player.z, player.yaw, player.pitch)
+                    send_chat_message(conn, f"已传送到 ({x}, {y}, {z})")
+                except ValueError:
+                    send_chat_message(conn, "用法: /tp <x> <y> <z> - 坐标必须是数字")
+            elif len(args) == 4:
+                # 传送目标到指定坐标: /tp <目标> <x> <y> <z>
+                target_selector = args[0]
+                targets = player_manager.resolve_selector(target_selector, username, (player.x, player.y, player.z))
+                
+                if not targets:
+                    send_chat_message(conn, f"找不到目标: {target_selector}")
+                    return
+                
+                try:
+                    x = _parse_coord(args[1], player.x)
+                    y = _parse_coord(args[2], player.y)
+                    z = _parse_coord(args[3], player.z)
+                    
+                    count = 0
+                    for target in targets:
+                        target.x = x
+                        target.y = y
+                        target.z = z
+                        if target.conn:
+                            send_player_position_and_look(target.conn, target.x, target.y, target.z, target.yaw, target.pitch)
+                        count += 1
+                    
+                    send_chat_message(conn, f"已将 {count} 个玩家传送到 ({x}, {y}, {z})")
+                except ValueError as e:
+                    send_chat_message(conn, f"坐标格式错误: {e}")
+            else:
+                send_chat_message(conn, "用法: /tp [目标] <x> <y> <z> 或 /tp <目标> [目的地]")
+        
         elif command == '/help':
             help_text = """可用命令:
 /time - 查看当前时间
@@ -527,6 +710,16 @@ def handle_command(conn: socket.socket, username: str, message: str, world_manag
 /time noon - 设置为正午
 /time midnight - 设置为午夜
 /time <数值> - 设置具体时间 (0-24000)
+/gamerule - 查看游戏规则
+/gamerule <规则> - 查看特定规则
+/gamerule <规则> <值> - 设置规则
+/gamemode <模式> - 切换游戏模式 (0=生存, 1=创造, 2=冒险, 3=旁观)
+/tp <x> <y> <z> - 传送到指定坐标
+/tp <目标> - 传送到玩家/选择器位置
+/tp <目标> <目的地> - 传送玩家到玩家位置
+/tp <目标> <x> <y> <z> - 传送玩家到坐标
+坐标支持: ~相对坐标 (~10=当前+10, ~=当前位置)
+选择器: @s=自己, @p=最近玩家, @a=所有玩家, @r=随机玩家
 /help - 显示此帮助"""
             send_chat_message(conn, help_text)
         
@@ -536,6 +729,46 @@ def handle_command(conn: socket.socket, username: str, message: str, world_manag
     except Exception as e:
         log_error(f"Error handling command '{command}' from {username}: {e}")
         send_chat_message(conn, f"命令执行出错: {e}")
+
+
+def _is_number(s: str) -> bool:
+    """检查字符串是否是数字（支持 ~ 相对坐标前缀）"""
+    if s.startswith('~') or s.startswith('^'):
+        s = s[1:]
+    if not s:
+        return True  # 只有 ~ 也是有效的
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_coord(s: str, relative_to: float) -> float:
+    """解析坐标，支持相对坐标 (~) 和局部坐标 (^)
+    ~10 = relative_to + 10
+    ~ = relative_to
+    10 = 10 (绝对坐标)
+    """
+    s = s.strip()
+    
+    if s.startswith('~'):
+        # 相对坐标
+        offset_str = s[1:]
+        if offset_str:
+            return relative_to + float(offset_str)
+        else:
+            return relative_to
+    elif s.startswith('^'):
+        # 局部坐标（简化处理，当作相对坐标）
+        offset_str = s[1:]
+        if offset_str:
+            return relative_to + float(offset_str)
+        else:
+            return relative_to
+    else:
+        # 绝对坐标
+        return float(s)
 
 
 def send_chat_message(conn: socket.socket, message: str):

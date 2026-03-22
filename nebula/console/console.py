@@ -41,7 +41,9 @@ def console_handler():
         if not args:
             # 显示当前时间
             current_time = int(world_manager.world_time) if world_manager else 6000
+            total_ticks = int(world_manager.world_total_time) if world_manager else 0
             log_info(f"Current time: {current_time} (0=sunrise, 6000=noon, 12000=sunset, 18000=midnight)")
+            log_info(f"Total ticks: {total_ticks}")
             return
         
         # 设置时间
@@ -66,6 +68,49 @@ def console_handler():
             world_manager.broadcast_time_update()
             log_info(f"Time set to: {new_time}")
 
+    def cmd_gamerule(args):
+        """查看或设置游戏规则"""
+        from nebula.world.world_manager import get_world_manager
+        world_manager = get_world_manager()
+        
+        if not world_manager:
+            log_info("World not initialized")
+            return
+        
+        if not args:
+            # 显示所有游戏规则
+            log_info("Game rules:")
+            for rule, value in world_manager.game_rules.items():
+                log_info(f"  {rule}: {value}")
+            return
+        
+        if len(args) == 1:
+            # 显示特定规则
+            rule = args[0]
+            if rule in world_manager.game_rules:
+                log_info(f"{rule}: {world_manager.game_rules[rule]}")
+            else:
+                log_info(f"Unknown game rule: {rule}")
+            return
+        
+        # 设置规则
+        rule = args[0]
+        value = args[1].lower()
+        
+        if rule not in world_manager.game_rules:
+            log_info(f"Unknown game rule: {rule}")
+            return
+        
+        # 转换值为布尔值或保持字符串
+        if value in ('true', '1', 'yes'):
+            world_manager.game_rules[rule] = True
+        elif value in ('false', '0', 'no'):
+            world_manager.game_rules[rule] = False
+        else:
+            world_manager.game_rules[rule] = value
+        
+        log_info(f"Game rule {rule} set to: {world_manager.game_rules[rule]}")
+
     # 命令映射表
     commands = {
         "version": cmd_version,
@@ -82,6 +127,7 @@ def console_handler():
         "help": "Display this help message",
         "stop": "Stop the server",
         "time": "Show or set world time (time [day|night|noon|midnight|<number>])",
+        "gamerule": "Show or set game rules (gamerule [rule] [value])",
     }
 
     # 主循环
@@ -100,6 +146,8 @@ def console_handler():
             
             if cmd == "time":
                 cmd_time(args)
+            elif cmd == "gamerule":
+                cmd_gamerule(args)
             elif cmd in commands:
                 commands[cmd]()
             else:
